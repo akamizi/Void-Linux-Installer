@@ -235,6 +235,22 @@ Remove the USB drive when prompted (or just after the screen goes blank).
 
 ## After installation
 
+### No desktop environment
+
+This installer produces a minimal **base system only** — no graphical
+environment is included. After the first boot you will have a console login.
+
+To install a desktop environment:
+
+```sh
+# XFCE example
+xbps-install -Sy xorg xfce4 xfce4-plugins lightdm lightdm-gtk3-greeter
+ln -s /etc/sv/lightdm /var/service/
+```
+
+Refer to the [Void Linux documentation](https://docs.voidlinux.org) for other
+desktop environments (GNOME, KDE, etc.).
+
 ### First boot
 
 - The LUKS2 passphrase is asked once by the initramfs (dracut).
