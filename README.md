@@ -53,8 +53,9 @@ BTRFS subvolumes, and direct UEFI boot (no GRUB).
                       ├── @home        /home
                       ├── @swap        /swap          (swapfile, COW disabled)
                       ├── @snapshots   /.snapshots
-                      ├── @var_log     /var/log       (excluded from snapshots)
-                      └── @var_cache_xbps  /var/cache/xbps  (nested, excluded from snapshots)
+                      ├── @var_log     /var/log            (excluded from snapshots)
+                      ├── @var_cache_xbps  /var/cache/xbps  (excluded from snapshots)
+                      └── @srv         /srv                (excluded from snapshots)
 ```
 
 `/tmp` is a `tmpfs` (RAM-backed, cleared on reboot, `noexec`/`nosuid`/`nodev`).

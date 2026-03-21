@@ -34,7 +34,7 @@ EOF
 ### TIMEZONE E TASTIERA ###
 echo "[chroot 3] Configurazione timezone e tastiera..."
 ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
-hwclock --systohc
+hwclock --systohc 2>/dev/null || true   # può fallire in chroot senza accesso RTC
 
 # /etc/rc.conf: configurazione runit (Void usa runit, non systemd)
 #   KEYMAP: layout tastiera per la console virtuale (loadkeys)
@@ -92,7 +92,13 @@ UUID=${ROOT_UUID}  /home        btrfs  ${BTRFS_OPTS},subvol=@home       0  2
 UUID=${ROOT_UUID}  /.snapshots  btrfs  ${BTRFS_OPTS},subvol=@snapshots  0  2
 
 # Log separati da snapshot: post-ripristino si hanno log reali, non "del passato"
-UUID=${ROOT_UUID}  /var/log     btrfs  ${BTRFS_OPTS},subvol=@var_log    0  2
+UUID=${ROOT_UUID}  /var/log         btrfs  ${BTRFS_OPTS},subvol=@var_log        0  2
+
+# Cache pacchetti xbps (separata da snapshot: ricostruibile da xbps)
+UUID=${ROOT_UUID}  /var/cache/xbps  btrfs  ${BTRFS_OPTS},subvol=@var_cache_xbps  0  2
+
+# /srv separata da snapshot
+UUID=${ROOT_UUID}  /srv             btrfs  ${BTRFS_OPTS},subvol=@srv              0  2
 
 # Swap (subvolume dedicato, NON in snapshot, cifrato via LUKS2)
 UUID=${ROOT_UUID}  /swap        btrfs  ${SWAP_BTRFS_OPTS},subvol=@swap  0  2
@@ -167,13 +173,6 @@ EOF
 if [[ "$ENABLE_UKI" == "true" ]]; then
     echo "[chroot 7] [UKI] Configurazione dracut per Unified Kernel Image..."
 
-    EFI_STUB="/usr/lib/gummiboot/linuxx64.efi.stub"
-    if [[ ! -f "$EFI_STUB" ]]; then
-        echo "ERRORE: stub EFI non trovato in $EFI_STUB" >&2
-        echo "  Assicurati che il pacchetto 'gummiboot' sia installato." >&2
-        exit 1
-    fi
-
     # La cmdline embedded nell'UKI: letta da /etc/kernel/cmdline da dracut.
     # A differenza della cmdline in efibootmgr (testo modificabile), questa viene
     # compilata nel binario EFI — non alterabile senza ricostruire (e rifirmare) l'UKI.
@@ -187,13 +186,16 @@ if [[ "$ENABLE_UKI" == "true" ]]; then
     # Se fosse presente, il trigger xbps genererebbe un UKI automaticamente,
     # e poi l'hook ne genererebbe un secondo. Due UKI → comportamento indefinito.
     # La generazione UKI è delegata esclusivamente all'hook con dracut --uefi esplicito.
-    # uefi_stub e kernel_cmdline vengono letti dall'hook quando chiama dracut --uefi.
+    # kernel_cmdline viene letto dall'hook quando chiama dracut --uefi.
+    #
+    # uefi_stub è OMESSO: dracut rileva automaticamente lo stub cercando in ordine:
+    #   /lib/systemd/boot/efi/linuxx64.efi.stub  (systemd-boot)
+    #   /usr/lib/gummiboot/linuxx64.efi.stub      (gummiboot)
+    # Questo rende lo script resiliente a cambi di path tra versioni/pacchetti.
     cat > /etc/dracut.conf.d/20-uki.conf <<EOF
 # UKI configuration — letto da dracut quando l'hook chiama 'dracut --uefi'
 # uefi=yes è ASSENTE: evita doppia generazione UKI (trigger xbps + hook)
-
-# Template PE/EFI usato da dracut per costruire l'UKI via objcopy
-uefi_stub=${EFI_STUB}
+# uefi_stub è ASSENTE: dracut rileva automaticamente gummiboot o systemd-boot
 
 # Cmdline kernel embedded nell'UKI (anche leggibile da /etc/kernel/cmdline)
 # Per aggiornare la cmdline: editare /etc/kernel/cmdline e rieseguire l'hook
@@ -340,9 +342,6 @@ EFI_PARTNUM=${EFI_PARTNUM}
 LUKS_UUID=${LUKS_UUID_BAKED}
 ROOT_UUID=${ROOT_UUID_BAKED}
 
-# Path stub EFI per dracut (usato solo con ENABLE_UKI=true)
-EFI_STUB=/usr/lib/gummiboot/linuxx64.efi.stub
-
 # Path chiavi Secure Boot (usato solo con ENABLE_SECUREBOOT=true)
 SB_KEY=/etc/secureboot/db.key
 SB_CERT=/etc/secureboot/db.crt
@@ -400,7 +399,7 @@ if [[ "$ENABLE_UKI" == "true" ]]; then
     # Genera UKI: dracut bundla kernel + initramfs + cmdline (da /etc/kernel/cmdline
     # via kernel_cmdline in /etc/dracut.conf.d/20-uki.conf) in un unico PE/EFI.
     # --force: sovrascrive output esistente
-    # --uefi:  attiva modalità UKI (usa uefi_stub da dracut.conf)
+    # --uefi:  attiva modalità UKI (stub rilevato automaticamente da dracut)
     # --output: path fisso → l'entry efibootmgr non cambia tra aggiornamenti kernel
     echo "efistub hook: generazione UKI per kernel ${KVER}..."
     dracut --force --uefi --output "$UKI_UNSIGNED" "$KVER"

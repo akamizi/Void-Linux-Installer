@@ -16,7 +16,7 @@
 #   @swap      /swap        (swapfile — COW disabilitato, no compressione)
 #   @snapshots /.snapshots
 #   @var_log   /var/log     (fuori da snapshot: log reali post-ripristino)
-#   @var_cache_xbps  /var/cache/xbps  (nested: cache pacchetti fuori da snapshot)
+#   @var_cache_xbps  /var/cache/xbps  (cache pacchetti, esclusa da snapshot)
 #
 # /tmp: tmpfs (si svuota a ogni riavvio, RAM-backed, più sicuro di un subvolume)
 #
@@ -244,6 +244,7 @@ cd /
 ### PARTIZIONAMENTO ###
 echo ""
 echo "[1/7] Partizionamento GPT ($DISK_NAME)..."
+wipefs -a "$DISK_NAME"
 sgdisk --zap-all "$DISK_NAME"
 sgdisk \
     --new=1:0:+1G     --typecode=1:ef00 --change-name=1:"EFI" \
@@ -252,7 +253,7 @@ sgdisk \
 
 # Notifica il kernel delle nuove partizioni e attendi che udev le crei in /dev.
 # Senza questo, mkfs.vfat potrebbe non trovare il device ancora.
-partprobe "$DISK_NAME" 2>/dev/null || true
+blockdev --rereadpt "$DISK_NAME" 2>/dev/null || true
 udevadm settle
 sleep 1   # margine di sicurezza per udev
 
@@ -327,6 +328,8 @@ btrfs subvolume create /mnt/@home          # /home
 btrfs subvolume create /mnt/@swap          # /swap (swapfile)
 btrfs subvolume create /mnt/@snapshots     # /.snapshots
 btrfs subvolume create /mnt/@var_log       # /var/log
+btrfs subvolume create /mnt/@var_cache_xbps  # /var/cache/xbps (cache pacchetti, esclusa da snapshot)
+btrfs subvolume create /mnt/@srv             # /srv             (esclusa da snapshot)
 
 umount /mnt
 
@@ -334,8 +337,9 @@ umount /mnt
 echo "[5/7] Montaggio filesystem..."
 mount -o "${BTRFS_OPTS},subvol=@" /dev/mapper/cryptroot /mnt
 
-# Crea le directory PRIMA del rispettivo mount (eccetto boot/EFI/void)
-mkdir -p /mnt/{home,swap,.snapshots,var/log,var/cache/xbps,srv,tmp}
+# Crea le directory PRIMA del rispettivo mount.
+# 'boot' va inclusa qui: subvolume @ è vuoto, /mnt/boot non esiste ancora.
+mkdir -p /mnt/{boot,home,swap,.snapshots,var/log,var/cache/xbps,srv,tmp}
 
 # /boot: partizione EFI — montata PRIMA di creare boot/EFI/void
 # umask/fmask/dmask=0077: solo root può leggere kernel e initramfs
@@ -349,11 +353,9 @@ mkdir -p /mnt/boot/EFI/void
 mount -o "${BTRFS_OPTS},subvol=@home"      /dev/mapper/cryptroot /mnt/home
 mount -o "${BTRFS_OPTS},subvol=@swap"      /dev/mapper/cryptroot /mnt/swap
 mount -o "${BTRFS_OPTS},subvol=@snapshots" /dev/mapper/cryptroot /mnt/.snapshots
-mount -o "${BTRFS_OPTS},subvol=@var_log"   /dev/mapper/cryptroot /mnt/var/log
-
-# Subvolumi nested: automaticamente esclusi da snapshot del subvolume padre
-btrfs subvolume create /mnt/var/cache/xbps
-btrfs subvolume create /mnt/srv
+mount -o "${BTRFS_OPTS},subvol=@var_log"        /dev/mapper/cryptroot /mnt/var/log
+mount -o "${BTRFS_OPTS},subvol=@var_cache_xbps" /dev/mapper/cryptroot /mnt/var/cache/xbps
+mount -o "${BTRFS_OPTS},subvol=@srv"            /dev/mapper/cryptroot /mnt/srv
 
 ### INSTALLAZIONE SISTEMA BASE ###
 echo "[6/7] Installazione sistema base Void Linux..."
