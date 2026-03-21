@@ -1,35 +1,681 @@
 #!/bin/bash
 
-# THIS SCRIPT IS INVOKED BY void-installer AS "THE" CHROOT SCRIPT. THE RANDOM
-# VARIABLES THAT ARE EXPORTED HERE COME FROM THE void-installer SCRIPT.
+# void-installer-chroot: eseguito in chroot da void-installer
+#
+# Variabili ricevute dal parent:
+#   HOSTNAME, BTRFS_OPTS, DISK_NAME, EFI_PART, ROOT_PART
+#   USERNAME, CPU_VENDOR, LOCALE, TIMEZONE, KEYMAP, SWAP_SIZE
+#   ENABLE_UKI, ENABLE_SECUREBOOT, ENABLE_SNAPPER
 
-# EXIT ON ANY ERROR
-set -e
+set -euo pipefail
 
-# USE ENGLISH UTF-8 ENCODING
-sed -i '/en_US-UTF-8/s/^#//g' /etc/default/libc-locales
+### LOCALE ###
+echo "[chroot 1] Configurazione locale: $LOCALE..."
+sed -i "s|^#\(${LOCALE} \)|\1|" /etc/default/libc-locales
+sed -i 's|^#\(en_US.UTF-8 \)|\1|' /etc/default/libc-locales
 xbps-reconfigure -f glibc-locales
 
-# WRITE THE FSTAB
-UEFI_UUID=$(blkid -s UUID -o value $UEFI_PART)
-ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/cryptroot)
-cat <<EOF > /etc/fstab
-UUID=$ROOT_UUID / btrfs $BTRFS_OPTS,subvol=@ 0 1
-UUID=$UEFI_UUID /boot vfat defaults,noatime 0 2
-UUID=$ROOT_UUID /var btrfs $BTRFS_OPTS,subvol=@var 0 2
-UUID=$ROOT_UUID /.snapshots btrfs $BTRFS_OPTS,subvol=@snapshots 0 2
-tmpfs /tmp tmpfs defaults,nosuid,nodev 0 0
+cat > /etc/locale.conf <<EOF
+LANG=${LOCALE}
+LC_COLLATE=C
 EOF
 
-# SOME MORE STUFF WE NEED
-xbps-install -Sy void-repo-nonfree # we need this for intel-ucode
-xbps-install -Sy intel-ucode
+### HOSTNAME E RETE ###
+echo "[chroot 2] Configurazione hostname..."
+echo "$HOSTNAME" > /etc/hostname
+cat > /etc/hosts <<EOF
+127.0.0.1   localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+::1         localhost ip6-localhost ip6-loopback
+ff02::1     ip6-allnodes
+ff02::2     ip6-allrouters
+EOF
 
-# SETUP BOOTLOADER AND INITRD
-xbps-install -Sy grub-x86_64-efi
-echo hostonly=yes >> /etc/dracut.conf
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id="Void Linux"
+### TIMEZONE E TASTIERA ###
+echo "[chroot 3] Configurazione timezone e tastiera..."
+ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+hwclock --systohc
+
+# /etc/rc.conf: configurazione runit (Void usa runit, non systemd)
+#   KEYMAP: layout tastiera per la console virtuale (loadkeys)
+#   HARDWARECLOCK: UTC raccomandato; "localtime" solo per dual-boot con Windows
+#   TIMEZONE: usato da alcuni tool; il link /etc/localtime è la fonte autorevole
+{
+    grep -v "^KEYMAP=\|^HARDWARECLOCK=\|^TIMEZONE=" /etc/rc.conf 2>/dev/null || true
+    echo "KEYMAP=\"${KEYMAP}\""
+    echo 'HARDWARECLOCK="UTC"'
+    echo "TIMEZONE=\"${TIMEZONE}\""
+} > /etc/rc.conf.new
+mv /etc/rc.conf.new /etc/rc.conf
+
+### SWAPFILE BTRFS ###
+# Requisiti obbligatori per swapfile su BTRFS:
+#   1. truncate -s 0: crea file vuoto senza pre-allocare spazio (poi dd alloca)
+#   2. chattr +C: disabilita Copy-on-Write — BTRFS richiede il file contiguo per swap
+#   3. btrfs property compression none: compressione incompatibile con swapfile
+#   4. chmod 600: solo root può accedere
+#   5. dd con /dev/zero: alloca fisicamente i blocchi (no hole punching)
+#   6. mkswap: formatta come area di swap
+#
+# Il file è su @swap, subvolume dedicato NON incluso in snapshot.
+# Cifrato automaticamente essendo dentro il volume LUKS2.
+echo "[chroot 4] Creazione swapfile (${SWAP_SIZE}GB)..."
+SWAPFILE=/swap/swapfile
+truncate -s 0 "$SWAPFILE"
+chattr +C "$SWAPFILE"
+btrfs property set "$SWAPFILE" compression none
+chmod 600 "$SWAPFILE"
+dd if=/dev/zero of="$SWAPFILE" bs=1G count="$SWAP_SIZE" status=progress
+mkswap "$SWAPFILE"
+
+### FSTAB ###
+echo "[chroot 5] Generazione /etc/fstab..."
+
+EFI_UUID=$(blkid -s UUID -o value "$EFI_PART")
+ROOT_UUID=$(blkid -s UUID -o value /dev/mapper/cryptroot)
+LUKS_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+
+# @swap: no compress, no discard (incompatibili con swapfile BTRFS)
+SWAP_BTRFS_OPTS="rw,noatime,ssd,space_cache=v2"
+
+cat > /etc/fstab <<EOF
+# /etc/fstab — generato da void-installer
+# <dispositivo>               <mountpoint>  <tipo>  <opzioni>                                            <dump> <pass>
+
+# Root (BTRFS @ subvolume, dentro LUKS2)
+UUID=${ROOT_UUID}  /            btrfs  ${BTRFS_OPTS},subvol=@           0  1
+
+# Home (separata: snapshot indipendenti di / e /home)
+UUID=${ROOT_UUID}  /home        btrfs  ${BTRFS_OPTS},subvol=@home       0  2
+
+# Snapshots
+UUID=${ROOT_UUID}  /.snapshots  btrfs  ${BTRFS_OPTS},subvol=@snapshots  0  2
+
+# Log separati da snapshot: post-ripristino si hanno log reali, non "del passato"
+UUID=${ROOT_UUID}  /var/log     btrfs  ${BTRFS_OPTS},subvol=@var_log    0  2
+
+# Swap (subvolume dedicato, NON in snapshot, cifrato via LUKS2)
+UUID=${ROOT_UUID}  /swap        btrfs  ${SWAP_BTRFS_OPTS},subvol=@swap  0  2
+/swap/swapfile     none         swap   sw                                0  0
+
+# /tmp: tmpfs RAM-backed
+#   noexec: impedisce esecuzione diretta di binari depositati in /tmp
+#   nosuid: ignora bit suid/sgid (vettore di privilege escalation)
+#   nodev:  ignora device files
+#   size=4G: limite; adatta in base alla RAM disponibile
+tmpfs              /tmp         tmpfs  defaults,nodev,nosuid,noexec,size=4G  0  0
+
+# EFI (FAT32, non cifrata): kernel + initramfs/UKI accessibili a UEFI pre-boot
+# umask=0077 / fmask=0177 / dmask=0077: solo root può leggere/listare
+UUID=${EFI_UUID}   /boot        vfat   rw,noatime,nosuid,nodev,noexec,umask=0077,fmask=0177,dmask=0077  0  2
+EOF
+
+### CRYPTTAB ###
+# dracut legge questo file per sapere quale device decriptare nell'initramfs.
+# Con efistub + LUKS2 il flusso è:
+#   UEFI legge /boot (non cifrata) → carica vmlinuz/UKI →
+#   initramfs legge crypttab → chiede passphrase → monta BTRFS → boot
+echo "cryptroot UUID=${LUKS_UUID} none luks,discard" > /etc/crypttab
+
+### DRACUT — CONFIGURAZIONE BASE ###
+echo "[chroot 6] Configurazione dracut (initramfs)..."
+# hostonly=yes: initramfs minimalista — solo driver e moduli di questo hardware
+#   PRO: boot più veloce, superficie d'attacco ridotta (meno codice in initramfs)
+#   CONTRO: l'initramfs non funziona su hardware diverso (non è un problema)
+# add_dracutmodules: include esplicitamente crypt (LUKS) e btrfs nell'initramfs
+# install_items: /etc/crypttab deve essere dentro l'initramfs per aprire LUKS2
+# compress=zstd: initramfs compresso con zstd (più veloce di gzip, spazio comparabile)
+mkdir -p /etc/dracut.conf.d
+cat > /etc/dracut.conf.d/10-base.conf <<EOF
+hostonly=yes
+hostonly_cmdline=yes
+add_dracutmodules+=" crypt btrfs "
+install_items+=" /etc/crypttab "
+compress=zstd
+EOF
+
+### [OPZIONALE] UKI — UNIFIED KERNEL IMAGE ###
+#
+# Cos'è un UKI:
+#   Un singolo file PE/EFI che contiene al suo interno, come sezioni del binario:
+#     .linux   → il kernel vmlinuz
+#     .initrd  → l'initramfs dracut
+#     .cmdline → i parametri kernel (embedded, NON modificabili da UEFI)
+#     .osrel   → /etc/os-release (identificazione del sistema)
+#   UEFI carica questo unico file come qualsiasi altro eseguibile EFI.
+#
+# Perché è più sicuro dell'efistub classico (vmlinuz + initramfs separati):
+#   Con file separati, un attaccante con accesso fisico ("evil maid") può:
+#     - Modificare la cmdline in efibootmgr aggiungendo init=/bin/bash
+#     - Sostituire l'initramfs con uno che apre una shell prima della passphrase LUKS
+#   Con UKI, tutti e tre sono bundled e firmabili come un'unità atomica.
+#   Con Secure Boot attivo: UEFI verifica la firma dell'UKI prima di eseguirlo.
+#   Se qualcosa è stato manomesso → firma non valida → UEFI rifiuta il boot.
+#
+# Svantaggio principale:
+#   La cmdline è embedded → per cambiarla (es. nomodeset per debug) bisogna
+#   ricostruire l'UKI, non basta editare un file di testo.
+#   Con efistub classico basta modificare l'entry efibootmgr in 5 secondi.
+#
+# Nota sulla doppia esecuzione di dracut in modalità UKI:
+#   Il trigger xbps che installa nuovi kernel chiama dracut → genera initramfs normale.
+#   Il nostro hook (/etc/kernel.d/post-install/10-efistub) chiama poi dracut --uefi → UKI.
+#   Due esecuzioni dracut per kernel update sono un overhead accettabile (~30s extra).
+#   L'alternativa (uefi=yes in dracut.conf) causerebbe due UKI: uno generato dal trigger
+#   xbps e uno dall'hook — confusione garantita. Il design attuale è esplicito e controllato.
+#
+if [[ "$ENABLE_UKI" == "true" ]]; then
+    echo "[chroot 7] [UKI] Configurazione dracut per Unified Kernel Image..."
+
+    EFI_STUB="/usr/lib/gummiboot/linuxx64.efi.stub"
+    if [[ ! -f "$EFI_STUB" ]]; then
+        echo "ERRORE: stub EFI non trovato in $EFI_STUB" >&2
+        echo "  Assicurati che il pacchetto 'gummiboot' sia installato." >&2
+        exit 1
+    fi
+
+    # La cmdline embedded nell'UKI: letta da /etc/kernel/cmdline da dracut.
+    # A differenza della cmdline in efibootmgr (testo modificabile), questa viene
+    # compilata nel binario EFI — non alterabile senza ricostruire (e rifirmare) l'UKI.
+    mkdir -p /etc/kernel
+    # Il file deve essere su UNA SOLA RIGA (dracut lo legge intero come cmdline)
+    printf 'rd.luks.uuid=%s rd.luks.name=%s=cryptroot root=UUID=%s rootflags=subvol=@ rw quiet loglevel=3\n' \
+        "$LUKS_UUID" "$LUKS_UUID" "$ROOT_UUID" > /etc/kernel/cmdline
+
+    # Configurazione dracut per UKI.
+    # NOTA: uefi=yes è INTENZIONALMENTE ASSENTE.
+    # Se fosse presente, il trigger xbps genererebbe un UKI automaticamente,
+    # e poi l'hook ne genererebbe un secondo. Due UKI → comportamento indefinito.
+    # La generazione UKI è delegata esclusivamente all'hook con dracut --uefi esplicito.
+    # uefi_stub e kernel_cmdline vengono letti dall'hook quando chiama dracut --uefi.
+    cat > /etc/dracut.conf.d/20-uki.conf <<EOF
+# UKI configuration — letto da dracut quando l'hook chiama 'dracut --uefi'
+# uefi=yes è ASSENTE: evita doppia generazione UKI (trigger xbps + hook)
+
+# Template PE/EFI usato da dracut per costruire l'UKI via objcopy
+uefi_stub=${EFI_STUB}
+
+# Cmdline kernel embedded nell'UKI (anche leggibile da /etc/kernel/cmdline)
+# Per aggiornare la cmdline: editare /etc/kernel/cmdline e rieseguire l'hook
+kernel_cmdline="$(cat /etc/kernel/cmdline)"
+EOF
+
+    echo "  UKI configurato: output in /boot/EFI/void/void-linux.efi"
+    echo "  Cmdline embedded: $(cat /etc/kernel/cmdline)"
+fi
+
+### MICROCODE ###
+echo "[chroot 8] Installazione microcode ($CPU_VENDOR)..."
+xbps-install -Sy void-repo-nonfree
+if [[ "$CPU_VENDOR" == "intel" ]]; then
+    xbps-install -Sy intel-ucode
+elif [[ "$CPU_VENDOR" == "amd" ]]; then
+    xbps-install -Sy linux-firmware-amd
+else
+    echo "ATTENZIONE: vendor '$CPU_VENDOR' non riconosciuto, microcode non installato."
+fi
+
+### [OPZIONALE] SECURE BOOT — GENERAZIONE CHIAVI ###
+#
+# Cos'è Secure Boot:
+#   Un meccanismo UEFI che verifica la firma crittografica di ogni eseguibile EFI
+#   prima di caricarlo. Se la firma non è riconosciuta → boot bloccato.
+#   Protegge contro bootkit e modifiche offline al bootloader/kernel.
+#
+# La gerarchia di chiavi (PKI):
+#
+#   PK  (Platform Key)
+#   │   Root of trust. Una sola PK per firmware. Auto-firmata.
+#   │   Firmando una nuova PK si "prende possesso" del firmware UEFI.
+#   │
+#   └── KEK  (Key Exchange Key)
+#       │   Firmata da PK. Autorizza l'aggiornamento del database di firme (db/dbx).
+#       │
+#       └── db  (Signature Database)
+#               Firmata da KEK. Contiene i certificati che possono firmare eseguibili EFI.
+#               Il nostro db.crt va qui.
+#
+# Nota su Setup Mode:
+#   Il firmware UEFI accetta l'enrollment SOLO in "Setup Mode" (PK cleared).
+#   Come entrare: UEFI → Security → Secure Boot → Clear/Delete Keys.
+#
+# Nota su Microsoft Keys:
+#   Questo script sostituisce TUTTO con chiavi custom (no Microsoft).
+#   PRO: controllo totale sulla catena di fiducia.
+#   CONTRO: no boot di eseguibili EFI firmati solo da Microsoft (raro su Linux).
+#
+if [[ "$ENABLE_SECUREBOOT" == "true" ]]; then
+    echo "[chroot 9] [Secure Boot] Generazione chiavi RSA4096..."
+
+    SB_DIR="/etc/secureboot"
+    mkdir -p "$SB_DIR"
+    chmod 700 "$SB_DIR"
+
+    SB_GUID=$(cat /proc/sys/kernel/random/uuid)
+    echo "$SB_GUID" > "$SB_DIR/guid.txt"
+
+    # rsa:4096   chiave RSA a 4096 bit
+    # -days 3650 validità 10 anni
+    # -nodes     nessuna password sulla chiave privata (necessaria per firma automatica)
+    # sha256     unico hash supportato da tutti i firmware UEFI (sha512 non universale)
+    CERT_OPTS=(-newkey rsa:4096 -days 3650 -nodes -sha256)
+
+    echo "  Generazione PK (Platform Key)..."
+    openssl req -new -x509 "${CERT_OPTS[@]}" \
+        -keyout "$SB_DIR/PK.key" -out "$SB_DIR/PK.crt" \
+        -subj "/CN=Platform Key - ${HOSTNAME}/" 2>/dev/null
+
+    echo "  Generazione KEK (Key Exchange Key)..."
+    openssl req -new -x509 "${CERT_OPTS[@]}" \
+        -keyout "$SB_DIR/KEK.key" -out "$SB_DIR/KEK.crt" \
+        -subj "/CN=Key Exchange Key - ${HOSTNAME}/" 2>/dev/null
+
+    echo "  Generazione db (Signature Database key)..."
+    openssl req -new -x509 "${CERT_OPTS[@]}" \
+        -keyout "$SB_DIR/db.key" -out "$SB_DIR/db.crt" \
+        -subj "/CN=Signature Database - ${HOSTNAME}/" 2>/dev/null
+
+    chmod 400 "$SB_DIR"/*.key   # chiavi private: solo root, sola lettura
+
+    # Conversione X.509 → EFI Signature List (.esl): formato richiesto da UEFI
+    echo "  Conversione certificati in EFI Signature List (.esl)..."
+    cert-to-efi-sig-list -g "$SB_GUID" "$SB_DIR/PK.crt"  "$SB_DIR/PK.esl"
+    cert-to-efi-sig-list -g "$SB_GUID" "$SB_DIR/KEK.crt" "$SB_DIR/KEK.esl"
+    cert-to-efi-sig-list -g "$SB_GUID" "$SB_DIR/db.crt"  "$SB_DIR/db.esl"
+
+    # Creazione variabili autenticate (.auth):
+    #   PK.auth  → PK.esl firmato da PK stessa (auto-firma, primo enrollment)
+    #   KEK.auth → KEK.esl firmato da PK
+    #   db.auth  → db.esl firmato da KEK
+    echo "  Creazione variabili autenticate (.auth)..."
+    sign-efi-sig-list -k "$SB_DIR/PK.key"  -c "$SB_DIR/PK.crt"  PK  "$SB_DIR/PK.esl"  "$SB_DIR/PK.auth"
+    sign-efi-sig-list -k "$SB_DIR/PK.key"  -c "$SB_DIR/PK.crt"  KEK "$SB_DIR/KEK.esl" "$SB_DIR/KEK.auth"
+    sign-efi-sig-list -k "$SB_DIR/KEK.key" -c "$SB_DIR/KEK.crt" db  "$SB_DIR/db.esl"  "$SB_DIR/db.auth"
+
+    # Copia .auth + certificati pubblici nella partizione EFI per enrollment manuale
+    mkdir -p /boot/EFI/secureboot
+    cp "$SB_DIR"/*.auth /boot/EFI/secureboot/
+    cp "$SB_DIR"/*.crt  /boot/EFI/secureboot/
+
+    echo "  Chiavi generate in $SB_DIR"
+    echo "  File .auth copiati in /boot/EFI/secureboot/ per enrollment manuale"
+fi
+
+### HOOK AGGIORNAMENTI KERNEL ###
+#
+# Con efistub (classico o UKI) non c'è GRUB che gestisce automaticamente
+# gli aggiornamenti kernel. Quando xbps installa un nuovo kernel, questo hook:
+#
+#   Modalità efistub classico:
+#     1. Copia vmlinuz → /boot/EFI/void/vmlinuz (nome fisso)
+#     2. Copia initramfs → /boot/EFI/void/initramfs.img (nome fisso)
+#     3. Aggiorna entry efibootmgr (loader + initrd= in cmdline)
+#
+#   Modalità UKI:
+#     1. Chiama dracut --uefi esplicitamente → genera void-linux-unsigned.efi
+#        (dracut legge uefi_stub e kernel_cmdline da /etc/dracut.conf.d/20-uki.conf)
+#     2. Se Secure Boot: firma l'UKI con sbsign + db.key
+#     3. Aggiorna entry efibootmgr (loader = void-linux.efi, no initrd= in cmdline)
+#
+# Nome fisso (vmlinuz / void-linux.efi): l'entry efibootmgr resta valida tra update.
+#
+echo "[chroot 10] Installazione hook aggiornamenti kernel..."
+mkdir -p /etc/kernel.d/post-install
+
+LUKS_UUID_BAKED=$(blkid -s UUID -o value "$ROOT_PART")
+ROOT_UUID_BAKED=$(blkid -s UUID -o value /dev/mapper/cryptroot)
+EFI_PARTNUM=$(echo "$EFI_PART" | grep -o '[0-9]*$')
+DISK_BASE=$(echo "$EFI_PART" | sed 's/p\?[0-9]*$//')
+
+cat > /etc/efistub.conf <<EOF
+# /etc/efistub.conf — configurazione hook efistub/UKI
+# Editare e poi eseguire /etc/kernel.d/post-install/10-efistub <kver> per applicare.
+
+ENABLE_UKI=${ENABLE_UKI}
+ENABLE_SECUREBOOT=${ENABLE_SECUREBOOT}
+
+EFI_DIR=/boot/EFI/void
+DISK=${DISK_BASE}
+EFI_PARTNUM=${EFI_PARTNUM}
+LUKS_UUID=${LUKS_UUID_BAKED}
+ROOT_UUID=${ROOT_UUID_BAKED}
+
+# Path stub EFI per dracut (usato solo con ENABLE_UKI=true)
+EFI_STUB=/usr/lib/gummiboot/linuxx64.efi.stub
+
+# Path chiavi Secure Boot (usato solo con ENABLE_SECUREBOOT=true)
+SB_KEY=/etc/secureboot/db.key
+SB_CERT=/etc/secureboot/db.crt
+EOF
+
+cat > /etc/kernel.d/post-install/10-efistub <<'HOOK_EOF'
+#!/bin/bash
+# Hook efistub/UKI: aggiorna la partizione EFI e l'entry UEFI dopo ogni kernel update.
+# Chiamato dal trigger xbps con la versione kernel come argomento $1.
+
+set -euo pipefail
+
+KVER="$1"
+CONFIG=/etc/efistub.conf
+
+[[ -f "$CONFIG" ]] || { echo "efistub hook: $CONFIG non trovato." >&2; exit 1; }
+# shellcheck source=/etc/efistub.conf
+source "$CONFIG"
+
+KERNEL="/boot/vmlinuz-${KVER}"
+INITRAMFS="/boot/initramfs-${KVER}.img"
+
+[[ -f "$KERNEL" ]] || { echo "efistub hook: $KERNEL non trovato, skip." >&2; exit 0; }
+
+mkdir -p "$EFI_DIR"
+
+# Rimuove entry UEFI con lo stesso label (evita duplicati dopo ogni update)
+update_efi_entry() {
+    local label="$1" loader="$2" unicode="${3:-}"
+    efibootmgr --unicode 2>/dev/null | grep -F "$label" | \
+        grep -o 'Boot[0-9A-F]\{4\}' | sed 's/Boot//' | \
+        while read -r n; do efibootmgr --bootnum "$n" --delete-bootnum --quiet 2>/dev/null || true; done
+    if [[ -n "$unicode" ]]; then
+        efibootmgr --create --disk "$DISK" --part "$EFI_PARTNUM" \
+            --label "$label" --loader "$loader" --unicode "$unicode" --quiet
+    else
+        efibootmgr --create --disk "$DISK" --part "$EFI_PARTNUM" \
+            --label "$label" --loader "$loader" --quiet
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────
+# MODALITÀ UKI
+# ─────────────────────────────────────────────────────────────
+if [[ "$ENABLE_UKI" == "true" ]]; then
+
+    UKI_UNSIGNED="${EFI_DIR}/void-linux-unsigned.efi"
+    UKI_FINAL="${EFI_DIR}/void-linux.efi"
+
+    # Attendi initramfs generato dal trigger xbps (dracut normale, senza --uefi)
+    TIMEOUT=60; i=0
+    while [[ ! -f "$INITRAMFS" && $i -lt $TIMEOUT ]]; do sleep 1; ((i++)); done
+    [[ -f "$INITRAMFS" ]] || echo "efistub hook: initramfs non trovato dopo ${TIMEOUT}s, dracut lo genererà." >&2
+
+    # Genera UKI: dracut bundla kernel + initramfs + cmdline (da /etc/kernel/cmdline
+    # via kernel_cmdline in /etc/dracut.conf.d/20-uki.conf) in un unico PE/EFI.
+    # --force: sovrascrive output esistente
+    # --uefi:  attiva modalità UKI (usa uefi_stub da dracut.conf)
+    # --output: path fisso → l'entry efibootmgr non cambia tra aggiornamenti kernel
+    echo "efistub hook: generazione UKI per kernel ${KVER}..."
+    dracut --force --uefi --output "$UKI_UNSIGNED" "$KVER"
+
+    # ─── FIRMA SECURE BOOT ───────────────────────────────────
+    if [[ "$ENABLE_SECUREBOOT" == "true" ]]; then
+        if [[ ! -f "$SB_KEY" || ! -f "$SB_CERT" ]]; then
+            echo "efistub hook: chiavi SB non trovate, UKI non firmato." >&2
+            mv "$UKI_UNSIGNED" "$UKI_FINAL"
+        else
+            echo "efistub hook: firma UKI (sbsign)..."
+            sbsign --key "$SB_KEY" --cert "$SB_CERT" \
+                --output "$UKI_FINAL" "$UKI_UNSIGNED"
+            rm -f "$UKI_UNSIGNED"
+            sbverify --cert "$SB_CERT" "$UKI_FINAL" && \
+                echo "efistub hook: verifica firma OK" || \
+                echo "efistub hook: ATTENZIONE — verifica firma fallita" >&2
+        fi
+    else
+        mv "$UKI_UNSIGNED" "$UKI_FINAL"
+    fi
+
+    # Entry UEFI per UKI: NO cmdline separata.
+    # La cmdline è embedded nel .efi → non modificabile da UEFI (proprietà di sicurezza).
+    update_efi_entry "Void Linux" '\EFI\void\void-linux.efi'
+    echo "efistub hook: entry UEFI aggiornata → UKI ${KVER}"
+
+# ─────────────────────────────────────────────────────────────
+# MODALITÀ EFISTUB CLASSICO
+# ─────────────────────────────────────────────────────────────
+else
+    TIMEOUT=30; i=0
+    while [[ ! -f "$INITRAMFS" && $i -lt $TIMEOUT ]]; do sleep 1; ((i++)); done
+
+    cp "$KERNEL" "${EFI_DIR}/vmlinuz"
+    [[ -f "$INITRAMFS" ]] && cp "$INITRAMFS" "${EFI_DIR}/initramfs.img"
+
+    CMDLINE="rd.luks.uuid=${LUKS_UUID} rd.luks.name=${LUKS_UUID}=cryptroot"
+    CMDLINE="${CMDLINE} root=UUID=${ROOT_UUID} rootflags=subvol=@"
+    CMDLINE="${CMDLINE} rw quiet loglevel=3"
+    CMDLINE="${CMDLINE} initrd=\\EFI\\void\\initramfs.img"
+
+    update_efi_entry "Void Linux" '\EFI\void\vmlinuz' "$CMDLINE"
+    echo "efistub hook: entry UEFI aggiornata → efistub classico ${KVER}"
+fi
+HOOK_EOF
+chmod +x /etc/kernel.d/post-install/10-efistub
+
+### GENERAZIONE INITRAMFS / UKI + ENTRY UEFI INIZIALE ###
+echo "[chroot 11] Generazione initramfs/UKI e configurazione entry UEFI..."
+
+mkdir -p /boot/EFI/void
+
+# xbps-reconfigure -fa: rigenera initramfs per tutti i kernel installati.
+# In modalità UKI: genera solo initramfs normale (uefi=yes è assente da dracut.conf);
+# l'hook successivo chiamerà dracut --uefi per costruire l'UKI.
 xbps-reconfigure -fa
 
-# SET THE ROOT PASSWORD
+# Invoca l'hook per ogni kernel installato per registrare le entry UEFI.
+for KVER_PATH in /boot/vmlinuz-*; do
+    [[ -f "$KVER_PATH" ]] || continue
+    KVER="${KVER_PATH#/boot/vmlinuz-}"
+    echo "Configurazione boot entry per kernel: $KVER"
+    /etc/kernel.d/post-install/10-efistub "$KVER" || \
+        echo "ATTENZIONE: hook fallito per kernel $KVER (vedi output sopra)"
+done
+
+echo ""
+echo "Entry UEFI configurate:"
+efibootmgr --unicode 2>/dev/null | grep -i "boot\|void" || true
+
+### [OPZIONALE] SECURE BOOT — ENROLLMENT CHIAVI UEFI ###
+#
+# L'enrollment installa le chiavi (PK/KEK/db) nelle variabili NVRAM UEFI.
+# Senza enrollment le chiavi esistono su disco ma UEFI non le conosce.
+#
+# Requisito: firmware UEFI in "Setup Mode" (PK cleared).
+# Ordine OBBLIGATORIO: db → KEK → PK (PK per ultima: enrollarla esce da Setup Mode).
+#
+if [[ "$ENABLE_SECUREBOOT" == "true" ]]; then
+    echo ""
+    echo "[chroot 12] [Secure Boot] Tentativo enrollment automatico chiavi UEFI..."
+
+    SB_DIR="/etc/secureboot"
+    ENROLLED=false
+
+    if efi-updatevar -f "$SB_DIR/db.auth"  db  2>/dev/null && \
+       efi-updatevar -f "$SB_DIR/KEK.auth" KEK 2>/dev/null && \
+       efi-updatevar -f "$SB_DIR/PK.auth"  PK  2>/dev/null; then
+        echo "  Enrollment automatico completato."
+        ENROLLED=true
+    else
+        echo "  Enrollment automatico non riuscito (firmware probabilmente non in Setup Mode)."
+    fi
+
+    if [[ "$ENROLLED" == "false" ]]; then
+        echo ""
+        echo "  ┌──────────────────────────────────────────────────────────────────┐"
+        echo "  │  ENROLLMENT MANUALE SECURE BOOT — ISTRUZIONI                    │"
+        echo "  │                                                                  │"
+        echo "  │  1. Riavvia e accedi al firmware UEFI (F2/Del/F12)              │"
+        echo "  │  2. Vai in Security → Secure Boot                               │"
+        echo "  │  3. Cancella le chiavi esistenti (entra in 'Setup Mode')         │"
+        echo "  │  4. Seleziona 'Enroll keys from file'                           │"
+        echo "  │  5. Naviga: partizione EFI → EFI/secureboot/                   │"
+        echo "  │  6. Carica in ordine: db.auth → KEK.auth → PK.auth             │"
+        echo "  │     (PK per ULTIMA: enrollarla esce da Setup Mode)              │"
+        echo "  │  7. Salva e riavvia con Secure Boot abilitato                   │"
+        echo "  │                                                                  │"
+        echo "  │  File .auth: /boot/EFI/secureboot/  (già sulla partizione EFI) │"
+        echo "  │  Certificato pubblico: /etc/secureboot/db.crt                  │"
+        echo "  └──────────────────────────────────────────────────────────────────┘"
+    fi
+fi
+
+### [OPZIONALE] SNAPPER — SNAPSHOT AUTOMATICI BTRFS ###
+#
+# Snapper gestisce gli snapshot BTRFS in modo automatico e transazionale:
+#   - Timeline:  snapshot orari/giornalieri/settimanali schedulati da un servizio runit
+#   - Pre/post:  snapshot prima e dopo ogni installazione xbps (con xbps-trigger-snapper)
+#   - Cleanup:   rimozione automatica oltre i limiti configurati
+#
+# Prerequisiti già presenti:
+#   - @snapshots montato su /.snapshots: snapper richiede questa dir come subvolume BTRFS
+#   - @home separato: permette snapshot indipendenti di / e /home
+#
+# Nota: snapper crea snapshot del subvolume @, non dell'intero volume BTRFS.
+# Questo è il comportamento desiderato: @home, @var_log ecc. sono esclusi dagli
+# snapshot di @root e possono essere gestiti indipendentemente.
+#
+if [[ "$ENABLE_SNAPPER" == "true" ]]; then
+    echo "[chroot 13] Configurazione Snapper..."
+
+    # Crea le configurazioni snapper per root e home.
+    # snapper rileva automaticamente BTRFS e usa /.snapshots esistente.
+    # Se /.snapshots è già un subvolume montato (@snapshots), lo usa direttamente.
+    snapper -c root create-config / || \
+        echo "  ATTENZIONE: snapper create-config root fallito (verifica manualmente post-install)"
+    snapper -c home create-config /home || \
+        echo "  ATTENZIONE: snapper create-config home fallito (verifica manualmente post-install)"
+
+    # Limiti snapshot root:
+    #   NUMBER_LIMIT=10     max snapshot pre/post xbps (ultimi 10 update reversibili)
+    #   TIMELINE_*          5 orari, 7 giornalieri, 2 settimanali (buon compromesso spazio/granularità)
+    snapper -c root set-config \
+        NUMBER_LIMIT=10            \
+        NUMBER_LIMIT_IMPORTANT=5   \
+        TIMELINE_CREATE=yes        \
+        TIMELINE_CLEANUP=yes       \
+        TIMELINE_LIMIT_HOURLY=5    \
+        TIMELINE_LIMIT_DAILY=7     \
+        TIMELINE_LIMIT_WEEKLY=2    \
+        TIMELINE_LIMIT_MONTHLY=0   \
+        TIMELINE_LIMIT_YEARLY=0
+
+    # Limiti snapshot home: più contenuti (file personali cambiano continuamente)
+    snapper -c home set-config \
+        NUMBER_LIMIT=5             \
+        NUMBER_LIMIT_IMPORTANT=3   \
+        TIMELINE_CREATE=yes        \
+        TIMELINE_CLEANUP=yes       \
+        TIMELINE_LIMIT_HOURLY=3    \
+        TIMELINE_LIMIT_DAILY=7     \
+        TIMELINE_LIMIT_WEEKLY=1    \
+        TIMELINE_LIMIT_MONTHLY=0   \
+        TIMELINE_LIMIT_YEARLY=0
+
+    # Abilita servizi runit snapper (se presenti nel pacchetto)
+    for svc in snapper-timeline snapper-cleanup; do
+        if [[ -d "/etc/sv/$svc" ]]; then
+            ln -sf "/etc/sv/$svc" /etc/runit/runsvdir/default/
+            echo "  Servizio abilitato: $svc"
+        else
+            echo "  NOTA: servizio '$svc' non trovato — abilitare manualmente dopo l'install"
+            echo "        ln -s /etc/sv/$svc /var/service/"
+        fi
+    done
+
+    echo "  Snapper configurato per / e /home"
+    echo "  Snapshot manuale: snapper -c root create --description 'descrizione'"
+fi
+
+### UTENTE E SICUREZZA ###
+echo "[chroot 14] Configurazione utente e hardening..."
+
+useradd \
+    --create-home \
+    --groups wheel,audio,video,optical,storage,network,plugdev \
+    --shell /bin/bash \
+    "$USERNAME"
+echo "Imposta la password per $USERNAME:"
+passwd "$USERNAME"
+
+xbps-install -Sy sudo
+echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
+chmod 440 /etc/sudoers.d/wheel
+
+echo "Imposta la password per root:"
 passwd root
+
+# umask 027: nuovi file non leggibili da others (vs default 022)
+echo "umask 027" > /etc/profile.d/00-umask.sh
+
+# Hardening SSH preventivo
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
+PermitRootLogin no
+PasswordAuthentication no
+X11Forwarding no
+AuthenticationMethods publickey
+EOF
+
+### SYSCTL HARDENING ###
+# Parametri kernel per ridurre la superficie d'attacco del sistema in esecuzione.
+# Applicati a ogni boot tramite /etc/sysctl.d/ (caricato da runit via sysctl -p).
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
+# — Kernel info leak —
+# Impedisce a utenti non-root di leggere dmesg (rivela indirizzi, layout memoria, hw)
+kernel.dmesg_restrict = 1
+# Nasconde puntatori kernel in /proc (es. /proc/kallsyms): anche root non li vede.
+# Mitiga exploit che cercano indirizzi kernel per ROP chain o privilege escalation.
+kernel.kptr_restrict = 2
+
+# — Memory —
+# ASLR massimo: randomizza base stack, heap, VDSO, mmap ad ogni esecuzione.
+# Rende molto più difficile sfruttare buffer overflow con indirizzi predittibili.
+kernel.randomize_va_space = 2
+
+# — Filesystem —
+# Impedisce hard link a file di altri utenti (mitiga attacchi TOCTOU su /tmp)
+fs.protected_hardlinks = 1
+# Impedisce symlink traversal verso file di altri utenti (stesso principio)
+fs.protected_symlinks = 1
+
+# — Rete —
+# SYN cookies: mitiga SYN flood quando la listen queue si riempie
+net.ipv4.tcp_syncookies = 1
+# Reverse path filtering: scarta pacchetti con source irraggiungibile dall'interfaccia
+# ricevente. Mitiga IP spoofing e routing asimmetrico malevolo.
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+# Ignora ICMP redirect: un attaccante sulla LAN potrebbe deviare il traffico
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+# Non inviare redirect (questo host non è un router)
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+# Ignora ping broadcast (mitiga Smurf amplification attack)
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+EOF
+
+### NETWORKING ###
+xbps-install -Sy dhcpcd
+ln -sf /etc/sv/dhcpcd /etc/runit/runsvdir/default/
+
+echo ""
+echo "=== Chroot completato ==="
+echo ""
+if [[ "$ENABLE_UKI" == "true" ]]; then
+    echo "Modalità boot: UKI"
+    echo "  File:    /boot/EFI/void/void-linux.efi"
+    echo "  Cmdline: $(cat /etc/kernel/cmdline 2>/dev/null || echo 'non trovata')"
+    [[ "$ENABLE_SECUREBOOT" == "true" ]] && \
+        echo "  SB keys: /etc/secureboot/   .auth: /boot/EFI/secureboot/"
+else
+    echo "Modalità boot: efistub classico"
+    echo "  Kernel:    /boot/EFI/void/vmlinuz"
+    echo "  Initramfs: /boot/EFI/void/initramfs.img"
+fi
+[[ "$ENABLE_SNAPPER" == "true" ]] && echo "Snapper: configurato per / e /home"
+echo ""
+echo "Comandi utili post-install:"
+echo "  efibootmgr -v                     # verifica entry UEFI"
+echo "  xbps-install -Su                  # aggiornamenti (hook rigenera EFI automaticamente)"
+echo "  snapper -c root list              # lista snapshot (se snapper abilitato)"

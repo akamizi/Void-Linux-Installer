@@ -1,129 +1,419 @@
 #!/bin/bash
 
-# WARNING: THIS SCRIPT IS "EXTREMELY" DESTRUCTIVE. THATS THE POINT.
+# void-installer: Void Linux BTRFS + LUKS2 + efistub installer
 #
-# IF YOU WANT TO DO DIFFERENT THINGS THEN YOURE GONNA HAVE TO EDIT THE CODE.
+# LAYOUT DISCO (NVMe 1TB, GPT):
+#   p1    1G   EFI   FAT32   /boot        (kernel + initramfs/UKI accessibili a UEFI)
+#   p2  999G   LUKS2 BTRFS   /            (tutto il resto, cifrato)
+#
+# Con efistub non serve GRUB: UEFI carica direttamente vmlinuz (o UKI).
+# /boot non cifrata consente LUKS2 + argon2id (KDF molto più sicuro di pbkdf2/LUKS1).
+# dracut (initramfs) si occupa di decriptare LUKS2 al boot.
+#
+# SUBVOLUMI BTRFS:
+#   @          /
+#   @home      /home
+#   @swap      /swap        (swapfile — COW disabilitato, no compressione)
+#   @snapshots /.snapshots
+#   @var_log   /var/log     (fuori da snapshot: log reali post-ripristino)
+#   @var_cache_xbps  /var/cache/xbps  (nested: cache pacchetti fuori da snapshot)
+#
+# /tmp: tmpfs (si svuota a ogni riavvio, RAM-backed, più sicuro di un subvolume)
+#
+# OPZIONI AVANZATE (preimpostabili via env o prompt interattivo):
+#   ENABLE_UKI=true         Unified Kernel Image: kernel+initramfs+cmdline in un solo .efi
+#   ENABLE_SECUREBOOT=true  Secure Boot custom (richiede ENABLE_UKI=true)
+#   ENABLE_SNAPPER=true     Snapshot automatici BTRFS con snapper
+#   KEYMAP=it               Layout tastiera console (default: it)
+#
+# ATTENZIONE: questo script è DISTRUTTIVO per definizione.
 
-### INIT ###
+set -euo pipefail
 
-# USER VARIABLES
-#DISK_NAME=/dev/sda
-#DISK_NAME=/dev/nvme0n1
-#DISK_NAME=/dev/mmcblk0
-#HOSTNAME=voidmachine
+### CONFIGURAZIONE ###
 
-# REVIEW THE OUTPUT OF lsblk TO DETERMINE YOUR DISK NAME
-if [[ -z $DISK_NAME ]]; then
-    >&2 echo void-installer: variable DISK_NAME not set. See this script and output of lsblk.
-    exit 1
-elif [[ -z $HOSTNAME ]]; then
-    >&2 echo void-installer: variable HOSTNAME not set. See this script.
-    exit 1
-fi
-
-if [[ -z $DISK_NAME ]]; then
-    >&2 echo void-installer: variable HOSTNAME not set. This variable is name of your computer.
-    exit 1
-fi
-
-# EXIT ON ANY ERROR
-set -e
-
-# THIS REPO SHOULD JUST WORK
 REPO=https://repo-fastly.voidlinux.org/current
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 
-# WHATEVER PACKAGES YOU WANT AVAILABLE ON FIRST BOOT
-#EXTRA_PACKAGES=(vim xorg NetworkManager)
+# Opzioni BTRFS ottimizzate per NVMe:
+#   discard=async   TRIM non bloccante (kernel 5.6+, riduce latenza rispetto a discard sync)
+#   compress=zstd:1 zstd livello 1: ottimo rapporto CPU/compressione su NVMe veloci
+#   ssd             hint BTRFS per ottimizzazioni SSD (allocazione, defrag)
+#   space_cache=v2  cache free space più stabile e performante
+#   noatime         no aggiornamento atime (meno scritture, meno usura)
+#   commit=120      flush ogni 120s (sicuro con batteria/UPS; abbassa write amplification)
+BTRFS_OPTS="rw,noatime,compress=zstd:1,ssd,space_cache=v2,discard=async,commit=120"
 
-# FROM STACK OVERFLOW https://stackoverflow.com/a/246128
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+ENABLE_UKI="${ENABLE_UKI:-}"
+ENABLE_SECUREBOOT="${ENABLE_SECUREBOOT:-}"
+ENABLE_SNAPPER="${ENABLE_SNAPPER:-}"
+KEYMAP="${KEYMAP:-it}"
 
-# WORK FROM FS ROOT
+### VERIFICA DIPENDENZE ###
+# Controlla che tutti gli eseguibili necessari siano presenti nel sistema live
+# prima di procedere con operazioni distruttive.
+check_deps() {
+    local missing_cmds=()
+    local missing_pkgs=()
+
+    _need() {
+        if ! command -v "$1" &>/dev/null; then
+            missing_cmds+=("$1")
+            missing_pkgs+=("$2")
+        fi
+    }
+
+    _need sgdisk       gptfdisk      # partizionamento GPT scriptabile
+    _need cryptsetup   cryptsetup    # cifratura LUKS2
+    _need mkfs.vfat    dosfstools    # formattazione EFI FAT32
+    _need mkfs.btrfs   btrfs-progs   # formattazione BTRFS
+    _need btrfs        btrfs-progs   # gestione subvolumi
+    _need blkid        util-linux    # lettura UUID partizioni
+    _need udevadm      eudev         # attesa aggiornamento tabella partizioni
+    _need xbps-install xbps          # package manager Void Linux
+
+    if [[ ${#missing_cmds[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    echo "ERRORE: i seguenti eseguibili non sono disponibili sul sistema live:" >&2
+    local i
+    for i in "${!missing_cmds[@]}"; do
+        printf "  %-16s ← pacchetto: %s\n" "${missing_cmds[$i]}" "${missing_pkgs[$i]}" >&2
+    done
+    echo "" >&2
+
+    # Deduplicazione pacchetti (btrfs-progs appare due volte)
+    local unique_pkgs
+    mapfile -t unique_pkgs < <(printf '%s\n' "${missing_pkgs[@]}" | sort -u)
+    echo "Installa con: xbps-install -Sy ${unique_pkgs[*]}" >&2
+    exit 1
+}
+
+### TRAP CLEANUP ###
+# Con set -e, un errore a metà install lascia /mnt montato e cryptroot aperto.
+# Questo trap smonta tutto e chiude LUKS se l'installazione non è completata.
+_INSTALL_DONE=false
+cleanup() {
+    [[ "$_INSTALL_DONE" == "true" ]] && return 0
+    echo "" >&2
+    echo "Installazione interrotta. Pulizia in corso..." >&2
+    umount -R /mnt 2>/dev/null || true
+    if [[ -b /dev/mapper/cryptroot ]]; then
+        cryptsetup close cryptroot 2>/dev/null || true
+    fi
+    echo "Pulizia completata. Puoi rieseguire lo script." >&2
+}
+trap cleanup EXIT
+
+### SETUP INTERATTIVO ###
+
+echo "============================================"
+echo " Void Linux Installer — LUKS2 + BTRFS + efistub"
+echo "============================================"
+echo ""
+
+check_deps
+
+echo "Dischi disponibili:"
+lsblk -d -o NAME,SIZE,MODEL,TRAN 2>/dev/null || lsblk -d -o NAME,SIZE,MODEL
+echo ""
+
+if [[ -z "${DISK_NAME:-}" ]]; then
+    read -rp "Disco di destinazione (es. /dev/nvme0n1): " DISK_NAME
+fi
+if [[ ! -b "$DISK_NAME" ]]; then
+    echo "ERRORE: '$DISK_NAME' non trovato o non è un block device." >&2
+    exit 1
+fi
+
+if [[ -z "${HOSTNAME:-}" ]]; then
+    read -rp "Hostname della macchina: " HOSTNAME
+fi
+# Validazione hostname: solo lettere, numeri, trattini; max 63 caratteri
+if [[ ! "$HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
+    echo "ERRORE: hostname non valido (solo lettere, numeri, trattini; max 63 caratteri)." >&2
+    exit 1
+fi
+
+if [[ -z "${USERNAME:-}" ]]; then
+    read -rp "Nome utente principale: " USERNAME
+fi
+# Validazione username POSIX: inizia con lettera/underscore, solo [a-z0-9_-]
+if [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    echo "ERRORE: username non valido (minuscolo, inizia con lettera/underscore, max 32 caratteri)." >&2
+    exit 1
+fi
+
+# Rilevamento automatico CPU (per microcode)
+if [[ -z "${CPU_VENDOR:-}" ]]; then
+    if grep -q "GenuineIntel" /proc/cpuinfo 2>/dev/null; then
+        CPU_VENDOR=intel
+        echo "CPU rilevata: Intel (intel-ucode)"
+    elif grep -q "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
+        CPU_VENDOR=amd
+        echo "CPU rilevata: AMD (linux-firmware-amd)"
+    else
+        read -rp "Vendor CPU (intel/amd): " CPU_VENDOR
+    fi
+fi
+
+LOCALE="${LOCALE:-it_IT.UTF-8}"
+TIMEZONE="${TIMEZONE:-Europe/Rome}"
+SWAP_SIZE="${SWAP_SIZE:-8}"   # GB
+
+# Validazione SWAP_SIZE come numero intero
+if [[ ! "$SWAP_SIZE" =~ ^[0-9]+$ ]] || [[ "$SWAP_SIZE" -lt 1 ]]; then
+    echo "ERRORE: SWAP_SIZE deve essere un numero intero >= 1 (GB)." >&2
+    exit 1
+fi
+
+# Prompt UKI
+if [[ -z "$ENABLE_UKI" ]]; then
+    echo ""
+    echo "UKI (Unified Kernel Image): bundle kernel+initramfs+cmdline in un solo .efi."
+    echo "  Vantaggi: cmdline embedded e non modificabile, un solo file da firmare per Secure Boot."
+    echo "  Svantaggi: rebuild obbligatorio per cambiare parametri kernel, recovery più macchinoso."
+    read -rp "Abilitare UKI? [s/N]: " _uki_ans
+    [[ "$_uki_ans" =~ ^[sS]$ ]] && ENABLE_UKI=true || ENABLE_UKI=false
+fi
+
+# Prompt Secure Boot (solo se UKI attivo)
+if [[ "$ENABLE_UKI" == "true" && -z "$ENABLE_SECUREBOOT" ]]; then
+    echo ""
+    echo "Secure Boot: genera chiavi RSA4096 custom (PK/KEK/db), firma l'UKI."
+    echo "  Vantaggi: catena di fiducia UEFI→UKI verificata crittograficamente."
+    echo "  Richiede: mettere il firmware UEFI in 'Setup Mode' per enrollment chiavi."
+    read -rp "Abilitare Secure Boot? [s/N]: " _sb_ans
+    [[ "$_sb_ans" =~ ^[sS]$ ]] && ENABLE_SECUREBOOT=true || ENABLE_SECUREBOOT=false
+elif [[ "$ENABLE_UKI" != "true" ]]; then
+    # Secure Boot senza UKI non ha senso: non c'è un binario unico da firmare
+    if [[ "${ENABLE_SECUREBOOT:-false}" == "true" ]]; then
+        echo "ATTENZIONE: ENABLE_SECUREBOOT=true richiede ENABLE_UKI=true. Disabilitato." >&2
+    fi
+    ENABLE_SECUREBOOT=false
+fi
+
+# Prompt Snapper
+if [[ -z "$ENABLE_SNAPPER" ]]; then
+    echo ""
+    read -rp "Abilitare Snapper (snapshot automatici BTRFS)? [s/N]: " _snap_ans
+    [[ "$_snap_ans" =~ ^[sS]$ ]] && ENABLE_SNAPPER=true || ENABLE_SNAPPER=false
+fi
+
+### PASSPHRASE ###
+echo ""
+while true; do
+    read -s -rp "Passphrase di cifratura disco: " PASSPHRASE; echo ""
+    read -s -rp "Conferma passphrase:           " PASSPHRASE2; echo ""
+    [[ "$PASSPHRASE" == "$PASSPHRASE2" ]] && break
+    echo "Le passphrase non coincidono, riprova."
+done
+unset PASSPHRASE2
+
+### CONFERMA DISTRUTTIVA ###
+echo ""
+echo "========================================================"
+echo " ATTENZIONE: TUTTI I DATI SU $DISK_NAME VERRANNO PERSI"
+echo "========================================================"
+printf "  %-14s %s\n" "Disco:"        "$DISK_NAME"
+printf "  %-14s %s\n" "Hostname:"     "$HOSTNAME"
+printf "  %-14s %s\n" "Utente:"       "$USERNAME"
+printf "  %-14s %s\n" "CPU:"          "$CPU_VENDOR"
+printf "  %-14s %s\n" "Locale:"       "$LOCALE"
+printf "  %-14s %s\n" "Timezone:"     "$TIMEZONE"
+printf "  %-14s %s\n" "Keymap:"       "$KEYMAP"
+printf "  %-14s %s\n" "Swap:"         "${SWAP_SIZE}GB (swapfile BTRFS)"
+printf "  %-14s %s\n" "UKI:"          "$ENABLE_UKI"
+printf "  %-14s %s\n" "Secure Boot:"  "$ENABLE_SECUREBOOT"
+printf "  %-14s %s\n" "Snapper:"      "$ENABLE_SNAPPER"
+echo ""
+read -rp "Scrivi 'CONFERMO' per procedere: " CONFIRM
+[[ "$CONFIRM" == "CONFERMO" ]] || { echo "Operazione annullata."; exit 0; }
+
 cd /
 
-# OVERWRITE ENTIRE DISK WITH RANDOM DATA. THIS COULD TAKE A WHILE.
-#dd if=/dev/urandom of=$DISK_NAME
+### [OPZIONALE] SOVRASCRITTURA CON DATI CASUALI ###
+# Prima della cifratura, sovrascrivere il disco con dati casuali rende impossibile
+# distinguere i blocchi usati da quelli liberi, aumentando la sicurezza.
+# Su NVMe da 1TB richiede ore. Decommenta per abilitare:
+#
+# echo "Sovrascrittura disco con dati casuali (richiede ore su 1TB)..."
+# dd if=/dev/urandom of="$DISK_NAME" bs=4M status=progress conv=fdatasync || true
 
-### SETUP INSTALL ###
+### PARTIZIONAMENTO ###
+echo ""
+echo "[1/7] Partizionamento GPT ($DISK_NAME)..."
+sgdisk --zap-all "$DISK_NAME"
+sgdisk \
+    --new=1:0:+1G     --typecode=1:ef00 --change-name=1:"EFI" \
+    --new=2:0:0       --typecode=2:8300 --change-name=2:"cryptroot" \
+    "$DISK_NAME"
 
-# CREATE TWO PARTITIONS, ONE FOR EFI, ONE FOR OS
-fdisk $DISK_NAME << EOF
-g
-n
+# Notifica il kernel delle nuove partizioni e attendi che udev le crei in /dev.
+# Senza questo, mkfs.vfat potrebbe non trovare il device ancora.
+partprobe "$DISK_NAME" 2>/dev/null || true
+udevadm settle
+sleep 1   # margine di sicurezza per udev
 
-
-+512M
-n
-
-
-
-w
-EOF
-
-# FOR EASY PARTITION NAMING
-if [[ $DISK_NAME =~ nvme|mmcblk ]]; then
-    UEFI_PART=${DISK_NAME}p1
-    ROOT_PART=${DISK_NAME}p2
+# Naming partizioni: nvme/mmcblk usano suffisso 'p'
+if [[ "$DISK_NAME" =~ nvme|mmcblk ]]; then
+    EFI_PART="${DISK_NAME}p1"
+    ROOT_PART="${DISK_NAME}p2"
 else
-    UEFI_PART=${DISK_NAME}1
-    ROOT_PART=${DISK_NAME}2
+    EFI_PART="${DISK_NAME}1"
+    ROOT_PART="${DISK_NAME}2"
 fi
 
-# THE EFI PARTITION GETS A FAT32 FS
-mkfs.vfat -F32 $UEFI_PART
+### FORMATTAZIONE EFI ###
+echo "[2/7] Formattazione EFI (FAT32)..."
+mkfs.vfat -F32 -n EFI "$EFI_PART"
 
-# "THE" BTRFS OPTIONS
-BTRFS_OPTS=rw,noatime,compress=zstd,space_cache=v2,commit=120
+### CIFRATURA LUKS2 ###
+# argon2id: KDF memory-hard, resistente ad attacchi con GPU/ASIC/FPGA
+# Confronto con pbkdf2 usato da LUKS1/GRUB:
+#   pbkdf2   → iterazioni CPU pure, vulnerabile a GPU con migliaia di core
+#   argon2id → richiede molta RAM (512MB qui), parallelizzazione limitata
+#
+# Parametri:
+#   --pbkdf-memory 524288  512MB RAM per derivazione chiave
+#   --pbkdf-parallel 4     4 thread
+#   --iter-time 3000       calibra per ~3 secondi di calcolo
+#   aes-xts-plain64 512    AES-256-XTS, standard de facto per cifratura disco
+#   sha512                 hash per derivazione chiave interna
+echo "[3/7] Cifratura LUKS2 con argon2id..."
+echo "$PASSPHRASE" | cryptsetup luksFormat \
+    --type luks2 \
+    --cipher aes-xts-plain64 \
+    --key-size 512 \
+    --hash sha512 \
+    --pbkdf argon2id \
+    --pbkdf-memory 524288 \
+    --pbkdf-parallel 4 \
+    --iter-time 3000 \
+    --batch-mode \
+    "$ROOT_PART"
 
-# GET ENCRYPTION PASSPHRASE FROM USER
-read -s -p "void-installer: enter disk encryption passphrase: " PASSPHRASE
+echo "$PASSPHRASE" | cryptsetup luksOpen "$ROOT_PART" cryptroot
+unset PASSPHRASE
 
-# ENCRYPT ROOT PARTITION
-echo "$PASSPHRASE" | cryptsetup -q luksFormat --type=luks -s=512 $ROOT_PART
+### BACKUP HEADER LUKS2 ###
+# L'header LUKS2 contiene i keyslot cifrati e i metadati del volume.
+# Se corrotto (settore difettoso, scrittura interrotta durante aggiornamento),
+# i dati diventano IRRECUPERABILI senza backup.
+# cryptsetup stesso raccomanda il backup prima dell'uso.
+#
+# Il file viene salvato su /tmp del sistema live (volatile!).
+# PRIMA DI RIAVVIARE: copiarlo su USB/dispositivo esterno.
+#
+# Per ripristinare in caso di corruzione dell'header:
+#   cryptsetup luksHeaderRestore /dev/nvme0n1p2 --header-backup-file luks-header.bak
+LUKS_HEADER_BACKUP="/tmp/luks-header-$(date +%Y%m%d-%H%M%S).bak"
+cryptsetup luksHeaderBackup "$ROOT_PART" --header-backup-file "$LUKS_HEADER_BACKUP"
+chmod 400 "$LUKS_HEADER_BACKUP"
+echo ""
+echo "  *** BACKUP HEADER LUKS2: $LUKS_HEADER_BACKUP ***"
+echo "  *** Copia questo file su USB prima di riavviare! ***"
+echo ""
 
-# OPEN ENCRYPTED ROOT
-echo "$PASSPHRASE" | cryptsetup luksOpen $ROOT_PART cryptroot
+### BTRFS ###
+echo "[4/7] Formattazione BTRFS e creazione subvolumi..."
+mkfs.btrfs -L void /dev/mapper/cryptroot -q
 
-# THE MAPPED FS GETS FORMATTED WITH BTRFS <-- is this terminology correct?
-mkfs.btrfs /dev/mapper/cryptroot
+mount -o "$BTRFS_OPTS" /dev/mapper/cryptroot /mnt
 
-# MOUNT THE FS AT /mnt
-mount -o $BTRFS_OPTS /dev/mapper/cryptroot /mnt
+btrfs subvolume create /mnt/@              # /
+btrfs subvolume create /mnt/@home          # /home
+btrfs subvolume create /mnt/@swap          # /swap (swapfile)
+btrfs subvolume create /mnt/@snapshots     # /.snapshots
+btrfs subvolume create /mnt/@var_log       # /var/log
 
-# THE TOPLEVEL SUBVOLUMES
-btrfs subvolume create /mnt/@
-btrfs subvolume create /mnt/@var
-btrfs subvolume create /mnt/@snapshots
-
-# MOUNT THE ROOT SUBVOLUME AT /mnt
 umount /mnt
-mount -o $BTRFS_OPTS,subvol=@ /dev/mapper/cryptroot /mnt
 
-# BASIC SETUP
-mkdir /mnt/boot
-mkdir /mnt/var
-mkdir /mnt/.snapshots
-mount -o rw,noatime $UEFI_PART /mnt/boot
-mount -o $BTRFS_OPTS,subvol=@var /dev/mapper/cryptroot /mnt/var
-mount -o $BTRFS_OPTS,subvol=@snapshots /dev/mapper/cryptroot /mnt/.snapshots
+### MOUNT ###
+echo "[5/7] Montaggio filesystem..."
+mount -o "${BTRFS_OPTS},subvol=@" /dev/mapper/cryptroot /mnt
 
-btrfs subvolume create /mnt/srv # get this out of the way
+# Crea le directory PRIMA del rispettivo mount (eccetto boot/EFI/void)
+mkdir -p /mnt/{home,swap,.snapshots,var/log,var/cache/xbps,srv,tmp}
 
-### BASE INSTALLATION ###
+# /boot: partizione EFI — montata PRIMA di creare boot/EFI/void
+# umask/fmask/dmask=0077: solo root può leggere kernel e initramfs
+mount -o "rw,noatime,nosuid,nodev,noexec,umask=0077,fmask=0177,dmask=0077" \
+    "$EFI_PART" /mnt/boot
 
-# DO THE BASE INSTALL
-XBPS_ARCH=x86_64 xbps-install -S -y -R $REPO -r /mnt base-system btrfs-progs cryptsetup ${EXTRA_PACKAGES[@]}
+# boot/EFI/void va creato DOPO il mount di /boot, così finisce sulla FAT32
+# (se creato prima, finirebbe sul subvolume BTRFS @ e sarebbe mascherato dal mount)
+mkdir -p /mnt/boot/EFI/void
 
-# CHROOT
+mount -o "${BTRFS_OPTS},subvol=@home"      /dev/mapper/cryptroot /mnt/home
+mount -o "${BTRFS_OPTS},subvol=@swap"      /dev/mapper/cryptroot /mnt/swap
+mount -o "${BTRFS_OPTS},subvol=@snapshots" /dev/mapper/cryptroot /mnt/.snapshots
+mount -o "${BTRFS_OPTS},subvol=@var_log"   /dev/mapper/cryptroot /mnt/var/log
+
+# Subvolumi nested: automaticamente esclusi da snapshot del subvolume padre
+btrfs subvolume create /mnt/var/cache/xbps
+btrfs subvolume create /mnt/srv
+
+### INSTALLAZIONE SISTEMA BASE ###
+echo "[6/7] Installazione sistema base Void Linux..."
+
+BASE_PKGS=(base-system btrfs-progs cryptsetup gptfdisk efibootmgr)
+
+# Pacchetti per UKI: gummiboot fornisce il PE stub EFI
+# (/usr/lib/gummiboot/linuxx64.efi.stub) che dracut usa come template
+[[ "$ENABLE_UKI" == "true" ]] && BASE_PKGS+=(gummiboot)
+
+# Pacchetti per Secure Boot:
+#   sbsigntool — sbsign (firma EFI binari), sbverify (verifica firme)
+#   efitools   — cert-to-efi-sig-list, sign-efi-sig-list, efi-updatevar
+[[ "$ENABLE_SECUREBOOT" == "true" ]] && BASE_PKGS+=(sbsigntool efitools)
+
+# Pacchetti per Snapper
+[[ "$ENABLE_SNAPPER" == "true" ]] && BASE_PKGS+=(snapper)
+
+XBPS_ARCH=x86_64 xbps-install -S -y -R "$REPO" -r /mnt \
+    "${BASE_PKGS[@]}" \
+    ${EXTRA_PACKAGES[@]+"${EXTRA_PACKAGES[@]}"}
+
+### CHROOT ###
+echo "[7/7] Configurazione sistema (chroot)..."
 for dir in dev proc sys run; do
-    mount --rbind /$dir /mnt/$dir
-    mount --make-rslave /mnt/$dir
+    mount --rbind "/$dir" "/mnt/$dir"
+    mount --make-rslave "/mnt/$dir"
 done
-cp /etc/resolv.conf /mnt/etc
-cp $SCRIPT_DIR/void-installer-chroot /mnt/void-installer-chroot
-HOSTNAME=$HOSTNAME BTRFS_OPTS=$BTRFS_OPTS DISK_NAME=$DISK_NAME UEFI_PART=$UEFI_PART ROOT_PART=$ROOT_PART SCRIPT_DIR=$SCRIPT_DIR \
+cp /etc/resolv.conf /mnt/etc/resolv.conf
+cp "$SCRIPT_DIR/void-installer-chroot" /mnt/void-installer-chroot
+
+HOSTNAME="$HOSTNAME" \
+BTRFS_OPTS="$BTRFS_OPTS" \
+DISK_NAME="$DISK_NAME" \
+EFI_PART="$EFI_PART" \
+ROOT_PART="$ROOT_PART" \
+USERNAME="$USERNAME" \
+CPU_VENDOR="$CPU_VENDOR" \
+LOCALE="$LOCALE" \
+TIMEZONE="$TIMEZONE" \
+KEYMAP="$KEYMAP" \
+SWAP_SIZE="$SWAP_SIZE" \
+ENABLE_UKI="$ENABLE_UKI" \
+ENABLE_SECUREBOOT="$ENABLE_SECUREBOOT" \
+ENABLE_SNAPPER="$ENABLE_SNAPPER" \
     chroot /mnt /void-installer-chroot
+
 rm /mnt/void-installer-chroot
 
-# SUCCESS
-echo All Good! You can reboot.
+_INSTALL_DONE=true   # disattiva il trap cleanup
+
+echo ""
+echo "============================================"
+echo " Installazione completata con successo!"
+echo "============================================"
+echo ""
+echo "PRIMA DI RIAVVIARE — copia il backup header LUKS2:"
+echo "  $LUKS_HEADER_BACKUP"
+echo "  Esempio: cp $LUKS_HEADER_BACKUP /run/media/usb/"
+echo ""
+echo "Per riavviare:"
+echo "  umount -R /mnt && cryptsetup close cryptroot && reboot"
+echo ""
