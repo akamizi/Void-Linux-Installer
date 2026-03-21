@@ -388,6 +388,7 @@ for dir in dev proc sys run; do
 done
 cp /etc/resolv.conf /mnt/etc/resolv.conf
 cp "$SCRIPT_DIR/void-installer-chroot" /mnt/void-installer-chroot
+chmod +x /mnt/void-installer-chroot
 
 HOSTNAME="$HOSTNAME" \
 BTRFS_OPTS="$BTRFS_OPTS" \

@@ -11,8 +11,8 @@ set -euo pipefail
 
 ### LOCALE ###
 echo "[chroot 1] Configurazione locale: $LOCALE..."
-sed -i "s|^#\(${LOCALE} \)|\1|" /etc/default/libc-locales
-sed -i 's|^#\(en_US.UTF-8 \)|\1|' /etc/default/libc-locales
+sed -i "s|^#\(${LOCALE//./\\.} \)|\1|" /etc/default/libc-locales
+sed -i 's|^#\(en_US\.UTF-8 \)|\1|' /etc/default/libc-locales
 xbps-reconfigure -f glibc-locales
 
 cat > /etc/locale.conf <<EOF
