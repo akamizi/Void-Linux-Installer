@@ -362,14 +362,16 @@ echo "[6/7] Installazione sistema base Void Linux..."
 
 BASE_PKGS=(base-system btrfs-progs cryptsetup gptfdisk efibootmgr)
 
-# Pacchetti per UKI: gummiboot fornisce il PE stub EFI
-# (/usr/lib/gummiboot/linuxx64.efi.stub) che dracut usa come template
-[[ "$ENABLE_UKI" == "true" ]] && BASE_PKGS+=(gummiboot)
+# Pacchetti per UKI:
+#   gummiboot  — PE stub EFI usato da dracut come template per l'UKI
+#   binutils   — fornisce objcopy, usato da dracut --uefi per assemblare il PE/EFI
+[[ "$ENABLE_UKI" == "true" ]] && BASE_PKGS+=(gummiboot binutils)
 
 # Pacchetti per Secure Boot:
 #   sbsigntool — sbsign (firma EFI binari), sbverify (verifica firme)
 #   efitools   — cert-to-efi-sig-list, sign-efi-sig-list, efi-updatevar
-[[ "$ENABLE_SECUREBOOT" == "true" ]] && BASE_PKGS+=(sbsigntool efitools)
+#   openssl    — CLI per generare chiavi RSA4096 e certificati X.509
+[[ "$ENABLE_SECUREBOOT" == "true" ]] && BASE_PKGS+=(sbsigntool efitools openssl)
 
 # Pacchetti per Snapper
 [[ "$ENABLE_SNAPPER" == "true" ]] && BASE_PKGS+=(snapper)

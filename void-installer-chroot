@@ -373,7 +373,8 @@ update_efi_entry() {
     local label="$1" loader="$2" unicode="${3:-}"
     efibootmgr --unicode 2>/dev/null | grep -F "$label" | \
         grep -o 'Boot[0-9A-F]\{4\}' | sed 's/Boot//' | \
-        while read -r n; do efibootmgr --bootnum "$n" --delete-bootnum --quiet 2>/dev/null || true; done
+        while read -r n; do efibootmgr --bootnum "$n" --delete-bootnum --quiet 2>/dev/null || true; done \
+        || true
     if [[ -n "$unicode" ]]; then
         efibootmgr --create --disk "$DISK" --part "$EFI_PARTNUM" \
             --label "$label" --loader "$loader" --unicode "$unicode" --quiet
@@ -393,7 +394,7 @@ if [[ "$ENABLE_UKI" == "true" ]]; then
 
     # Attendi initramfs generato dal trigger xbps (dracut normale, senza --uefi)
     TIMEOUT=60; i=0
-    while [[ ! -f "$INITRAMFS" && $i -lt $TIMEOUT ]]; do sleep 1; ((i++)); done
+    while [[ ! -f "$INITRAMFS" && $i -lt $TIMEOUT ]]; do sleep 1; i=$((i+1)); done
     [[ -f "$INITRAMFS" ]] || echo "efistub hook: initramfs non trovato dopo ${TIMEOUT}s, dracut lo genererà." >&2
 
     # Genera UKI: dracut bundla kernel + initramfs + cmdline (da /etc/kernel/cmdline
@@ -432,7 +433,7 @@ if [[ "$ENABLE_UKI" == "true" ]]; then
 # ─────────────────────────────────────────────────────────────
 else
     TIMEOUT=30; i=0
-    while [[ ! -f "$INITRAMFS" && $i -lt $TIMEOUT ]]; do sleep 1; ((i++)); done
+    while [[ ! -f "$INITRAMFS" && $i -lt $TIMEOUT ]]; do sleep 1; i=$((i+1)); done
 
     cp "$KERNEL" "${EFI_DIR}/vmlinuz"
     [[ -f "$INITRAMFS" ]] && cp "$INITRAMFS" "${EFI_DIR}/initramfs.img"
@@ -570,7 +571,7 @@ if [[ "$ENABLE_SNAPPER" == "true" ]]; then
     # Abilita servizi runit snapper (se presenti nel pacchetto)
     for svc in snapper-timeline snapper-cleanup; do
         if [[ -d "/etc/sv/$svc" ]]; then
-            ln -sf "/etc/sv/$svc" /etc/runit/runsvdir/default/
+            ln -sf "/etc/sv/$svc" /var/service/
             echo "  Servizio abilitato: $svc"
         else
             echo "  NOTA: servizio '$svc' non trovato — abilitare manualmente dopo l'install"
@@ -656,7 +657,7 @@ EOF
 
 ### NETWORKING ###
 xbps-install -Sy dhcpcd
-ln -sf /etc/sv/dhcpcd /etc/runit/runsvdir/default/
+ln -sf /etc/sv/dhcpcd /var/service/
 
 echo ""
 echo "=== Chroot completato ==="
