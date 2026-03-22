@@ -5,14 +5,14 @@ BTRFS subvolumes, and direct UEFI boot (no GRUB).
 
 ---
 
-> ## ⚠ UNTESTED — READ BEFORE USING
+> ## ⚠ EARLY TESTING — READ BEFORE USING
 >
-> **This script has not been tested end-to-end on real hardware yet.**
+> **This script has been tested on one machine (Lenovo Ideapad 710S) and
+> completed successfully. It has not been tested on other hardware.**
 >
 > It is the result of a careful review and rewrite of existing guides and
-> scripts, but it has **not** gone through a full installation run. There may
-> be bugs, incorrect assumptions, or compatibility issues with specific
-> firmware or hardware configurations.
+> scripts. There may still be bugs, incorrect assumptions, or compatibility
+> issues with specific firmware or hardware configurations.
 >
 > **Do not run this script unless you:**
 > - understand partitioning, LUKS2, BTRFS subvolumes, and UEFI boot
@@ -323,7 +323,7 @@ This installer was built on the shoulders of:
 
 - **[Jesse Garcia](https://jesseg.co/articles/installing-void-linux/)** —
   for the NVMe-specific BTRFS mount options, the UKI/efistub approach, and
-  the gummiboot-based dracut workflow.
+  the systemd-boot-based dracut workflow.
 
 - **[NicholasBHubbard](https://github.com/NicholasBHubbard/Void-Linux-Installer)** —
   the original shell script that served as the starting point and structural

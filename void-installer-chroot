@@ -52,7 +52,6 @@ mv /etc/rc.conf.new /etc/rc.conf
 # Requisiti obbligatori per swapfile su BTRFS:
 #   1. truncate -s 0: crea file vuoto senza pre-allocare spazio (poi dd alloca)
 #   2. chattr +C: disabilita Copy-on-Write — BTRFS richiede il file contiguo per swap
-#   3. btrfs property compression none: compressione incompatibile con swapfile
 #   4. chmod 600: solo root può accedere
 #   5. dd con /dev/zero: alloca fisicamente i blocchi (no hole punching)
 #   6. mkswap: formatta come area di swap
@@ -63,7 +62,6 @@ echo "[chroot 4] Creazione swapfile (${SWAP_SIZE}GB)..."
 SWAPFILE=/swap/swapfile
 truncate -s 0 "$SWAPFILE"
 chattr +C "$SWAPFILE"
-btrfs property set "$SWAPFILE" compression none
 chmod 600 "$SWAPFILE"
 dd if=/dev/zero of="$SWAPFILE" bs=1G count="$SWAP_SIZE" status=progress
 mkswap "$SWAPFILE"
@@ -188,14 +186,12 @@ if [[ "$ENABLE_UKI" == "true" ]]; then
     # La generazione UKI è delegata esclusivamente all'hook con dracut --uefi esplicito.
     # kernel_cmdline viene letto dall'hook quando chiama dracut --uefi.
     #
-    # uefi_stub è OMESSO: dracut rileva automaticamente lo stub cercando in ordine:
-    #   /lib/systemd/boot/efi/linuxx64.efi.stub  (systemd-boot)
-    #   /usr/lib/gummiboot/linuxx64.efi.stub      (gummiboot)
-    # Questo rende lo script resiliente a cambi di path tra versioni/pacchetti.
     cat > /etc/dracut.conf.d/20-uki.conf <<EOF
 # UKI configuration — letto da dracut quando l'hook chiama 'dracut --uefi'
 # uefi=yes è ASSENTE: evita doppia generazione UKI (trigger xbps + hook)
-# uefi_stub è ASSENTE: dracut rileva automaticamente gummiboot o systemd-boot
+
+# Stub EFI richiesto esplicitamente: su Void Linux dracut non lo rileva automaticamente
+uefi_stub="/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
 
 # Cmdline kernel embedded nell'UKI (anche leggibile da /etc/kernel/cmdline)
 # Per aggiornare la cmdline: editare /etc/kernel/cmdline e rieseguire l'hook
@@ -399,11 +395,12 @@ if [[ "$ENABLE_UKI" == "true" ]]; then
 
     # Genera UKI: dracut bundla kernel + initramfs + cmdline (da /etc/kernel/cmdline
     # via kernel_cmdline in /etc/dracut.conf.d/20-uki.conf) in un unico PE/EFI.
-    # --force: sovrascrive output esistente
-    # --uefi:  attiva modalità UKI (stub rilevato automaticamente da dracut)
-    # --output: path fisso → l'entry efibootmgr non cambia tra aggiornamenti kernel
+    # --force:      sovrascrive output esistente
+    # --uefi:       attiva modalità UKI
+    # --uefi-stub:  path esplicito (Void Linux non ha il path default di dracut)
+    # path fisso → l'entry efibootmgr non cambia tra aggiornamenti kernel
     echo "efistub hook: generazione UKI per kernel ${KVER}..."
-    dracut --force --uefi --output "$UKI_UNSIGNED" "$KVER"
+    dracut --force --uefi --uefi-stub "/usr/lib/systemd/boot/efi/linuxx64.efi.stub" "$UKI_UNSIGNED" "$KVER"
 
     # ─── FIRMA SECURE BOOT ───────────────────────────────────
     if [[ "$ENABLE_SECUREBOOT" == "true" ]]; then
