@@ -67,6 +67,7 @@ BTRFS subvolumes, and direct UEFI boot (no GRUB).
 | `ENABLE_UKI` | prompt | Bundle kernel + initramfs + cmdline into a single signed `.efi` (Unified Kernel Image) |
 | `ENABLE_SECUREBOOT` | prompt | Generate custom PK/KEK/db keys, sign the UKI, prepare UEFI enrollment |
 | `ENABLE_SNAPPER` | prompt | Configure automatic BTRFS snapshots for `/` and `/home` |
+| `ENABLE_DESKTOP` | prompt | Install the Cinnamon desktop environment (greetd, PipeWire, NetworkManager) |
 | `KEYMAP` | `it` | Console keyboard layout |
 
 ---
@@ -158,6 +159,7 @@ cd Void-Linux-Installer
 ```sh
 less void-installer
 less void-installer-chroot
+less void-installer-desktop   # if you plan to use ENABLE_DESKTOP=true
 ```
 
 Understand what the scripts do before running them. The most important
@@ -176,6 +178,7 @@ tunables are at the top of `void-installer`:
 | `ENABLE_UKI` | prompted | |
 | `ENABLE_SECUREBOOT` | prompted | requires `ENABLE_UKI=true` |
 | `ENABLE_SNAPPER` | prompted | |
+| `ENABLE_DESKTOP` | prompted | installs Cinnamon; see `void-installer-desktop` |
 | `EXTRA_PACKAGES` | _(unset)_ | array of additional packages to install |
 
 All variables can be set as environment variables to skip the interactive
@@ -235,21 +238,31 @@ Remove the USB drive when prompted (or just after the screen goes blank).
 
 ## After installation
 
-### No desktop environment
+### Desktop environment
 
-This installer produces a minimal **base system only** — no graphical
-environment is included. After the first boot you will have a console login.
+By default this installer produces a minimal **base system only** — no
+graphical environment, console login only.
 
-To install a desktop environment:
+To install the Cinnamon desktop during installation, answer **yes** to the
+`ENABLE_DESKTOP` prompt, or pre-set the variable:
 
 ```sh
-# XFCE example
-xbps-install -Sy xorg xfce4 xfce4-plugins lightdm lightdm-gtk3-greeter
-ln -s /etc/sv/lightdm /var/service/
+ENABLE_DESKTOP=true ./void-installer
 ```
 
-Refer to the [Void Linux documentation](https://docs.voidlinux.org) for other
-desktop environments (GNOME, KDE, etc.).
+This runs `void-installer-desktop` inside the chroot, which installs:
+- **Cinnamon** desktop environment (`cinnamon-all`)
+- **greetd** login manager (with `agreety` greeter, `cinnamon-session` default)
+- **PipeWire** audio (system-level service; `wireplumber` per-user via XDG autostart)
+- **NetworkManager** (replaces `dhcpcd`)
+- **nemo** file manager, **xfce4-terminal**, **polkit-gnome**, **gnome-keyring**,
+  `power-profiles-daemon`, `touchegg`, base fonts
+
+To customise the desktop setup (different greeter, additional packages, etc.),
+edit `void-installer-desktop` before running the installer.
+
+For other desktop environments, refer to the
+[Void Linux documentation](https://docs.voidlinux.org).
 
 ### First boot
 

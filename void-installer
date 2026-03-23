@@ -24,6 +24,7 @@
 #   ENABLE_UKI=true         Unified Kernel Image: kernel+initramfs+cmdline in un solo .efi
 #   ENABLE_SECUREBOOT=true  Secure Boot custom (richiede ENABLE_UKI=true)
 #   ENABLE_SNAPPER=true     Snapshot automatici BTRFS con snapper
+#   ENABLE_DESKTOP=true     Ambiente desktop Cinnamon (greetd + PipeWire + NetworkManager)
 #   KEYMAP=it               Layout tastiera console (default: it)
 #
 # ATTENZIONE: questo script è DISTRUTTIVO per definizione.
@@ -47,6 +48,7 @@ BTRFS_OPTS="rw,noatime,compress=zstd:1,ssd,space_cache=v2,discard=async,commit=1
 ENABLE_UKI="${ENABLE_UKI:-}"
 ENABLE_SECUREBOOT="${ENABLE_SECUREBOOT:-}"
 ENABLE_SNAPPER="${ENABLE_SNAPPER:-}"
+ENABLE_DESKTOP="${ENABLE_DESKTOP:-}"
 KEYMAP="${KEYMAP:-it}"
 
 ### VERIFICA DIPENDENZE ###
@@ -201,6 +203,13 @@ if [[ -z "$ENABLE_SNAPPER" ]]; then
     [[ "$_snap_ans" =~ ^[sS]$ ]] && ENABLE_SNAPPER=true || ENABLE_SNAPPER=false
 fi
 
+# Prompt Desktop
+if [[ -z "$ENABLE_DESKTOP" ]]; then
+    echo ""
+    read -rp "Installare l'ambiente desktop Cinnamon? [s/N]: " _de_ans
+    [[ "$_de_ans" =~ ^[sS]$ ]] && ENABLE_DESKTOP=true || ENABLE_DESKTOP=false
+fi
+
 ### PASSPHRASE ###
 echo ""
 while true; do
@@ -227,6 +236,7 @@ printf "  %-14s %s\n" "Swap:"         "${SWAP_SIZE}GB (swapfile BTRFS)"
 printf "  %-14s %s\n" "UKI:"          "$ENABLE_UKI"
 printf "  %-14s %s\n" "Secure Boot:"  "$ENABLE_SECUREBOOT"
 printf "  %-14s %s\n" "Snapper:"      "$ENABLE_SNAPPER"
+printf "  %-14s %s\n" "Desktop:"      "$ENABLE_DESKTOP"
 echo ""
 read -rp "Scrivi 'CONFERMO' per procedere: " CONFIRM
 [[ "$CONFIRM" == "CONFERMO" ]] || { echo "Operazione annullata."; exit 0; }
@@ -389,6 +399,10 @@ done
 cp /etc/resolv.conf /mnt/etc/resolv.conf
 cp "$SCRIPT_DIR/void-installer-chroot" /mnt/void-installer-chroot
 chmod +x /mnt/void-installer-chroot
+if [[ "$ENABLE_DESKTOP" == "true" ]]; then
+    cp "$SCRIPT_DIR/void-installer-desktop" /mnt/void-installer-desktop
+    chmod +x /mnt/void-installer-desktop
+fi
 
 HOSTNAME="$HOSTNAME" \
 BTRFS_OPTS="$BTRFS_OPTS" \
@@ -404,9 +418,11 @@ SWAP_SIZE="$SWAP_SIZE" \
 ENABLE_UKI="$ENABLE_UKI" \
 ENABLE_SECUREBOOT="$ENABLE_SECUREBOOT" \
 ENABLE_SNAPPER="$ENABLE_SNAPPER" \
+ENABLE_DESKTOP="$ENABLE_DESKTOP" \
     chroot /mnt /void-installer-chroot
 
 rm /mnt/void-installer-chroot
+rm -f /mnt/void-installer-desktop
 
 _INSTALL_DONE=true   # disattiva il trap cleanup
 

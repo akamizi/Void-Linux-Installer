@@ -1,0 +1,85 @@
+#!/bin/bash
+
+# void-installer-desktop: installazione ambiente desktop Cinnamon
+#
+# Eseguito dentro chroot da void-installer-chroot (se ENABLE_DESKTOP=true).
+# Replica la configurazione del sistema base: Cinnamon su X11, greetd,
+# PipeWire (servizio di sistema), NetworkManager.
+#
+# Personalizzazione: modifica le variabili DESKTOP_PKGS qui sotto,
+# o la configurazione di greetd/PipeWire nelle sezioni successive.
+
+set -euo pipefail
+
+DESKTOP_PKGS=(
+    # DE Cinnamon
+    cinnamon-all            # meta-package: DE + screensaver + session + settings-daemon
+    nemo                    # file manager (fork di nautilus)
+    nemo-extensions         # estensioni: preview, terminal, image-converter, compare
+    xfce4-terminal          # terminale
+    xorg-server             # server X (Cinnamon gira su X11)
+
+    # Login manager e gestione sessione
+    greetd                  # login manager minimale (usa agreety per default)
+    elogind                 # session/login manager (logind senza systemd)
+    seatd                   # seat daemon (gestione accesso hardware per sessioni non-root)
+
+    # Audio (PipeWire)
+    pipewire                # server audio/video unificato
+    wireplumber             # session manager PipeWire (avviato per-utente da Cinnamon via XDG)
+    alsa-pipewire           # libreria ALSA → PipeWire (applicazioni ALSA usano PipeWire)
+    pulseaudio-utils        # pactl, paplay, ecc. (compatibilità PulseAudio)
+
+    # Rete
+    NetworkManager          # gestione connessioni cablate e wireless
+    network-manager-applet  # applet systray per NetworkManager
+
+    # Utilities desktop
+    polkit-gnome            # agente PolicyKit per dialoghi di autorizzazione in Cinnamon
+    gnome-keyring           # portachiavi password integrato con Cinnamon
+    power-profiles-daemon   # gestione profili energetici (performance/bilanciato/risparmio)
+    touchegg                # riconoscimento gesture touchpad/touchscreen multi-dito
+
+    # Font base
+    cantarell-fonts         # font UI GNOME/Cinnamon
+    dejavu-fonts-ttf        # font generici con buona copertura Unicode
+    noto-fonts-ttf          # font Google Noto (copertura Unicode ampia)
+    font-liberation-narrow-ttf  # sostituti metrici per Arial/Times/Courier
+)
+
+echo ">>> Installazione pacchetti desktop..."
+xbps-install -Sy "${DESKTOP_PKGS[@]}"
+
+# --- Configurazione greetd ---
+# agreety: greeter testuale minimale incluso con greetd.
+# Alternativa grafica: installare ReGreet o gtkgreet e aggiornare il comando qui.
+mkdir -p /etc/greetd
+cat > /etc/greetd/config.toml <<'EOF'
+[terminal]
+vt = 1
+
+[default_session]
+command = "agreety --cmd cinnamon-session"
+user = "greetd"
+EOF
+
+# --- Configurazione PipeWire come servizio di sistema ---
+# PipeWire gira a livello di sistema (runit/default), wireplumber per-utente (XDG autostart).
+# Adeguato per desktop a utente singolo; su sistemi multi-utente preferire user services.
+mkdir -p /etc/alsa/conf.d
+ln -sf /usr/share/alsa/alsa.conf.d/50-pipewire.conf \
+       /etc/alsa/conf.d/50-pipewire.conf
+ln -sf /usr/share/alsa/alsa.conf.d/99-pipewire-default.conf \
+       /etc/alsa/conf.d/99-pipewire-default.conf
+
+# --- Abilitazione servizi runit ---
+# NetworkManager sostituisce dhcpcd (gestisce DHCP internamente).
+# pipewire: servizio di sistema (vedi nota sopra).
+for svc in dbus elogind seatd NetworkManager greetd power-profiles-daemon touchegg pipewire; do
+    ln -sf /etc/sv/$svc /etc/runit/runsvdir/default/
+done
+
+# Rimuovi dhcpcd se abilitato dal sistema base: NetworkManager gestisce il DHCP.
+rm -f /etc/runit/runsvdir/default/dhcpcd
+
+echo ">>> Desktop Cinnamon configurato."

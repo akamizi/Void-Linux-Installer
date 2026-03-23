@@ -652,9 +652,15 @@ net.ipv4.conf.default.send_redirects = 0
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 EOF
 
-### NETWORKING ###
-xbps-install -Sy dhcpcd
-ln -sf /etc/sv/dhcpcd /var/service/
+### NETWORKING / DESKTOP ###
+if [[ "${ENABLE_DESKTOP:-false}" == "true" ]]; then
+    echo "[chroot 15] Installazione ambiente desktop..."
+    /void-installer-desktop
+else
+    # Sistema base senza DE: dhcpcd per connettività minima
+    xbps-install -Sy dhcpcd
+    ln -sf /etc/sv/dhcpcd /var/service/
+fi
 
 echo ""
 echo "=== Chroot completato ==="
@@ -671,6 +677,7 @@ else
     echo "  Initramfs: /boot/EFI/void/initramfs.img"
 fi
 [[ "$ENABLE_SNAPPER" == "true" ]] && echo "Snapper: configurato per / e /home"
+[[ "${ENABLE_DESKTOP:-false}" == "true" ]] && echo "Desktop: Cinnamon (greetd + PipeWire + NetworkManager)"
 echo ""
 echo "Comandi utili post-install:"
 echo "  efibootmgr -v                     # verifica entry UEFI"
