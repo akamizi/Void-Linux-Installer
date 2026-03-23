@@ -238,6 +238,15 @@ passwd root
 
 echo "umask 027" > /etc/profile.d/00-umask.sh
 
+# Hardening SSH preventivo
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
+PermitRootLogin no
+PasswordAuthentication no
+X11Forwarding no
+AuthenticationMethods publickey
+EOF
+
 ### FLUXBOX + XORG ###
 echo "[chroot 11] Installazione Fluxbox + Xorg..."
 xbps-install -Sy \
@@ -289,23 +298,45 @@ ln -sf /etc/sv/dhcpcd /etc/runit/runsvdir/default/
 ln -sf /etc/sv/dbus   /etc/runit/runsvdir/default/
 
 ### SYSCTL HARDENING ###
+# Parametri kernel per ridurre la superficie d'attacco del sistema in esecuzione.
+# Applicati a ogni boot tramite /etc/sysctl.d/ (caricato da runit via sysctl -p).
 echo "[chroot 13] Hardening sysctl..."
 mkdir -p /etc/sysctl.d
 cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
+# — Kernel info leak —
+# Impedisce a utenti non-root di leggere dmesg (rivela indirizzi, layout memoria, hw)
 kernel.dmesg_restrict = 1
+# Nasconde puntatori kernel in /proc (es. /proc/kallsyms): anche root non li vede.
+# Mitiga exploit che cercano indirizzi kernel per ROP chain o privilege escalation.
 kernel.kptr_restrict = 2
+
+# — Memory —
+# ASLR massimo: randomizza base stack, heap, VDSO, mmap ad ogni esecuzione.
+# Rende molto più difficile sfruttare buffer overflow con indirizzi predittibili.
 kernel.randomize_va_space = 2
+
+# — Filesystem —
+# Impedisce hard link a file di altri utenti (mitiga attacchi TOCTOU su /tmp)
 fs.protected_hardlinks = 1
+# Impedisce symlink traversal verso file di altri utenti (stesso principio)
 fs.protected_symlinks = 1
+
+# — Rete —
+# SYN cookies: mitiga SYN flood quando la listen queue si riempie
 net.ipv4.tcp_syncookies = 1
+# Reverse path filtering: scarta pacchetti con source irraggiungibile dall'interfaccia
+# ricevente. Mitiga IP spoofing e routing asimmetrico malevolo.
 net.ipv4.conf.all.rp_filter = 1
 net.ipv4.conf.default.rp_filter = 1
+# Ignora ICMP redirect: un attaccante sulla LAN potrebbe deviare il traffico
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
+# Non inviare redirect (questo host non è un router)
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
+# Ignora ping broadcast (mitiga Smurf amplification attack)
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 EOF
 

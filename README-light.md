@@ -109,6 +109,16 @@ DISK_NAME=/dev/sda FS_TYPE=ext4 HOSTNAME=mybox USERNAME=alice ./void-installer-l
 **Networking:** `dhcpcd`. For WiFi, install `wpa_supplicant` after the
 first boot.
 
+**Hardening** (applied automatically):
+
+- `umask 027` — new files not readable by other users
+- SSH pre-hardened: `PermitRootLogin no`, `PasswordAuthentication no`,
+  `X11Forwarding no`, `AuthenticationMethods publickey` (takes effect
+  if/when `openssh` is installed)
+- sysctl: `dmesg_restrict`, `kptr_restrict`, ASLR max,
+  `protected_hardlinks/symlinks`, SYN cookies, RP filter, ICMP redirect
+  suppression
+
 ---
 
 ## First boot
