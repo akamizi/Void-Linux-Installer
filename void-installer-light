@@ -1,0 +1,266 @@
+#!/bin/bash
+
+# void-installer-light: Void Linux senza cifratura disco
+#
+# LAYOUT DISCO (GPT, 2 partizioni):
+#   p1    1G   EFI   FAT32   /boot
+#   p2   ~∞    root          (BTRFS con subvolumi o ext4 semplice)
+#
+# BTRFS: subvolumi identici al void-installer principale, ottimizzato per SSD/NVMe.
+# ext4:  partizione singola, layout piatto. /tmp su tmpfs, swap su file.
+#
+# Boot: efistub diretto (no GRUB, no UKI, no Secure Boot).
+# Desktop: Fluxbox (WM minimale) + Xorg. Avvio con 'startx'.
+#
+# VARIABILI PREIMPOSTABILI via env:
+#   DISK_NAME, HOSTNAME, USERNAME, CPU_VENDOR
+#   FS_TYPE=btrfs|ext4    (default: prompt interattivo)
+#   LOCALE, TIMEZONE, KEYMAP, SWAP_SIZE
+
+set -euo pipefail
+
+### CONFIGURAZIONE ###
+
+REPO=https://repo-fastly.voidlinux.org/current
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+
+# Opzioni BTRFS (identiche al void-installer principale)
+BTRFS_OPTS="rw,noatime,compress=zstd:1,ssd,space_cache=v2,discard=async,commit=120"
+
+FS_TYPE="${FS_TYPE:-}"
+KEYMAP="${KEYMAP:-it}"
+
+### VERIFICA DIPENDENZE ###
+check_deps() {
+    local missing_cmds=() missing_pkgs=()
+    _need() { command -v "$1" &>/dev/null || { missing_cmds+=("$1"); missing_pkgs+=("$2"); }; }
+
+    _need sgdisk      gptfdisk
+    _need mkfs.vfat   dosfstools
+    _need mkfs.btrfs  btrfs-progs
+    _need mkfs.ext4   e2fsprogs
+    _need blkid       util-linux
+    _need udevadm     eudev
+    _need xbps-install xbps
+
+    [[ ${#missing_cmds[@]} -eq 0 ]] && return 0
+
+    echo "ERRORE: eseguibili mancanti:" >&2
+    local i
+    for i in "${!missing_cmds[@]}"; do
+        printf "  %-16s ← pacchetto: %s\n" "${missing_cmds[$i]}" "${missing_pkgs[$i]}" >&2
+    done
+    local unique_pkgs
+    mapfile -t unique_pkgs < <(printf '%s\n' "${missing_pkgs[@]}" | sort -u)
+    echo "Installa con: xbps-install -Sy ${unique_pkgs[*]}" >&2
+    exit 1
+}
+
+### TRAP CLEANUP ###
+_INSTALL_DONE=false
+cleanup() {
+    [[ "$_INSTALL_DONE" == "true" ]] && return 0
+    echo "" >&2
+    echo "Installazione interrotta. Pulizia in corso..." >&2
+    umount -R /mnt 2>/dev/null || true
+    echo "Pulizia completata." >&2
+}
+trap cleanup EXIT
+
+### SETUP INTERATTIVO ###
+
+echo "============================================"
+echo " Void Linux Light Installer"
+echo " (senza cifratura — efistub — Fluxbox)"
+echo "============================================"
+echo ""
+
+check_deps
+
+echo "Dischi disponibili:"
+lsblk -d -o NAME,SIZE,MODEL,TRAN 2>/dev/null || lsblk -d -o NAME,SIZE,MODEL
+echo ""
+
+if [[ -z "${DISK_NAME:-}" ]]; then
+    read -rp "Disco di destinazione (es. /dev/nvme0n1): " DISK_NAME
+fi
+if [[ ! -b "$DISK_NAME" ]]; then
+    echo "ERRORE: '$DISK_NAME' non trovato o non è un block device." >&2
+    exit 1
+fi
+
+if [[ -z "${HOSTNAME:-}" ]]; then
+    read -rp "Hostname della macchina: " HOSTNAME
+fi
+if [[ ! "$HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
+    echo "ERRORE: hostname non valido." >&2; exit 1
+fi
+
+if [[ -z "${USERNAME:-}" ]]; then
+    read -rp "Nome utente principale: " USERNAME
+fi
+if [[ ! "$USERNAME" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+    echo "ERRORE: username non valido." >&2; exit 1
+fi
+
+if [[ -z "${CPU_VENDOR:-}" ]]; then
+    if grep -q "GenuineIntel" /proc/cpuinfo 2>/dev/null; then
+        CPU_VENDOR=intel; echo "CPU rilevata: Intel"
+    elif grep -q "AuthenticAMD" /proc/cpuinfo 2>/dev/null; then
+        CPU_VENDOR=amd; echo "CPU rilevata: AMD"
+    else
+        read -rp "Vendor CPU (intel/amd): " CPU_VENDOR
+    fi
+fi
+
+# Selezione filesystem
+if [[ -z "$FS_TYPE" ]]; then
+    echo ""
+    echo "Filesystem disponibili:"
+    echo "  btrfs  Subvolumi, compressione zstd, TRIM asincrono (consigliato per SSD/NVMe)"
+    echo "  ext4   Layout semplice, massima compatibilità"
+    while true; do
+        read -rp "Filesystem [btrfs/ext4]: " FS_TYPE
+        [[ "$FS_TYPE" == "btrfs" || "$FS_TYPE" == "ext4" ]] && break
+        echo "  Inserisci 'btrfs' o 'ext4'."
+    done
+fi
+
+LOCALE="${LOCALE:-it_IT.UTF-8}"
+TIMEZONE="${TIMEZONE:-Europe/Rome}"
+SWAP_SIZE="${SWAP_SIZE:-8}"
+
+if [[ ! "$SWAP_SIZE" =~ ^[0-9]+$ ]] || [[ "$SWAP_SIZE" -lt 1 ]]; then
+    echo "ERRORE: SWAP_SIZE non valido." >&2; exit 1
+fi
+
+### CONFERMA ###
+echo ""
+echo "========================================================"
+echo " ATTENZIONE: TUTTI I DATI SU $DISK_NAME VERRANNO PERSI"
+echo "========================================================"
+printf "  %-14s %s\n" "Disco:"      "$DISK_NAME"
+printf "  %-14s %s\n" "Hostname:"   "$HOSTNAME"
+printf "  %-14s %s\n" "Utente:"     "$USERNAME"
+printf "  %-14s %s\n" "CPU:"        "$CPU_VENDOR"
+printf "  %-14s %s\n" "Filesystem:" "$FS_TYPE"
+printf "  %-14s %s\n" "Locale:"     "$LOCALE"
+printf "  %-14s %s\n" "Timezone:"   "$TIMEZONE"
+printf "  %-14s %s\n" "Keymap:"     "$KEYMAP"
+printf "  %-14s %s\n" "Swap:"       "${SWAP_SIZE}GB (swapfile)"
+printf "  %-14s %s\n" "Cifratura:"  "nessuna"
+printf "  %-14s %s\n" "Desktop:"    "Fluxbox + Xorg"
+echo ""
+read -rp "Scrivi 'CONFERMO' per procedere: " CONFIRM
+[[ "$CONFIRM" == "CONFERMO" ]] || { echo "Operazione annullata."; exit 0; }
+
+cd /
+
+### PARTIZIONAMENTO ###
+echo ""
+echo "[1/5] Partizionamento GPT ($DISK_NAME)..."
+wipefs -a "$DISK_NAME"
+sgdisk --zap-all "$DISK_NAME"
+sgdisk \
+    --new=1:0:+1G   --typecode=1:ef00 --change-name=1:"EFI" \
+    --new=2:0:0     --typecode=2:8300 --change-name=2:"root" \
+    "$DISK_NAME"
+
+blockdev --rereadpt "$DISK_NAME" 2>/dev/null || true
+udevadm settle
+sleep 1
+
+if [[ "$DISK_NAME" =~ nvme|mmcblk ]]; then
+    EFI_PART="${DISK_NAME}p1"
+    ROOT_PART="${DISK_NAME}p2"
+else
+    EFI_PART="${DISK_NAME}1"
+    ROOT_PART="${DISK_NAME}2"
+fi
+
+### FORMATTAZIONE E MOUNT ###
+echo "[2/5] Formattazione ($FS_TYPE) e montaggio..."
+mkfs.vfat -F32 -n EFI "$EFI_PART"
+
+if [[ "$FS_TYPE" == "btrfs" ]]; then
+    mkfs.btrfs -L void "$ROOT_PART" -q
+    mount -o "$BTRFS_OPTS" "$ROOT_PART" /mnt
+
+    btrfs subvolume create /mnt/@
+    btrfs subvolume create /mnt/@home
+    btrfs subvolume create /mnt/@swap
+    btrfs subvolume create /mnt/@snapshots
+    btrfs subvolume create /mnt/@var_log
+    btrfs subvolume create /mnt/@var_cache_xbps
+    btrfs subvolume create /mnt/@srv
+    umount /mnt
+
+    mount -o "${BTRFS_OPTS},subvol=@"              "$ROOT_PART" /mnt
+    mkdir -p /mnt/{boot,home,swap,.snapshots,var/log,var/cache/xbps,srv,tmp}
+    mount -o "rw,noatime,nosuid,nodev,noexec,umask=0077,fmask=0177,dmask=0077" \
+        "$EFI_PART" /mnt/boot
+    mkdir -p /mnt/boot/EFI/void
+    mount -o "${BTRFS_OPTS},subvol=@home"           "$ROOT_PART" /mnt/home
+    mount -o "${BTRFS_OPTS},subvol=@swap"           "$ROOT_PART" /mnt/swap
+    mount -o "${BTRFS_OPTS},subvol=@snapshots"      "$ROOT_PART" /mnt/.snapshots
+    mount -o "${BTRFS_OPTS},subvol=@var_log"        "$ROOT_PART" /mnt/var/log
+    mount -o "${BTRFS_OPTS},subvol=@var_cache_xbps" "$ROOT_PART" /mnt/var/cache/xbps
+    mount -o "${BTRFS_OPTS},subvol=@srv"            "$ROOT_PART" /mnt/srv
+
+else
+    # ext4: layout semplice, tutto su una partizione
+    mkfs.ext4 -L void -q "$ROOT_PART"
+    mount "$ROOT_PART" /mnt
+    mkdir -p /mnt/{boot,home,swap,tmp}
+    mount -o "rw,noatime,nosuid,nodev,noexec,umask=0077,fmask=0177,dmask=0077" \
+        "$EFI_PART" /mnt/boot
+    mkdir -p /mnt/boot/EFI/void
+fi
+
+### SISTEMA BASE ###
+echo "[3/5] Installazione sistema base..."
+BASE_PKGS=(base-system efibootmgr)
+[[ "$FS_TYPE" == "btrfs" ]] && BASE_PKGS+=(btrfs-progs)
+
+XBPS_ARCH=x86_64 xbps-install -S -y -R "$REPO" -r /mnt "${BASE_PKGS[@]}"
+
+### CHROOT ###
+echo "[4/5] Configurazione sistema (chroot)..."
+for dir in dev proc sys run; do
+    mount --rbind "/$dir" "/mnt/$dir"
+    mount --make-rslave "/mnt/$dir"
+done
+cp /etc/resolv.conf /mnt/etc/resolv.conf
+cp "$SCRIPT_DIR/void-installer-light-chroot" /mnt/void-installer-light-chroot
+chmod +x /mnt/void-installer-light-chroot
+
+HOSTNAME="$HOSTNAME" \
+BTRFS_OPTS="$BTRFS_OPTS" \
+DISK_NAME="$DISK_NAME" \
+EFI_PART="$EFI_PART" \
+ROOT_PART="$ROOT_PART" \
+USERNAME="$USERNAME" \
+CPU_VENDOR="$CPU_VENDOR" \
+LOCALE="$LOCALE" \
+TIMEZONE="$TIMEZONE" \
+KEYMAP="$KEYMAP" \
+SWAP_SIZE="$SWAP_SIZE" \
+FS_TYPE="$FS_TYPE" \
+    chroot /mnt /void-installer-light-chroot
+
+rm /mnt/void-installer-light-chroot
+_INSTALL_DONE=true
+
+echo ""
+echo "[5/5] Completato."
+echo ""
+echo "============================================"
+echo " Installazione completata con successo!"
+echo "============================================"
+echo ""
+echo "Per riavviare:"
+echo "  umount -R /mnt && reboot"
+echo ""
+echo "Primo avvio: login come $USERNAME, poi 'startx' per avviare Fluxbox."
+echo "(oppure X si avvia automaticamente se sei su tty1)"
+echo ""

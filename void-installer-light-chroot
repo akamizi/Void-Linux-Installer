@@ -1,0 +1,326 @@
+#!/bin/bash
+
+# void-installer-light-chroot: configurazione in chroot per void-installer-light
+#
+# Variabili ricevute dal parent:
+#   HOSTNAME, BTRFS_OPTS, DISK_NAME, EFI_PART, ROOT_PART
+#   USERNAME, CPU_VENDOR, LOCALE, TIMEZONE, KEYMAP, SWAP_SIZE, FS_TYPE
+
+set -euo pipefail
+
+### LOCALE ###
+echo "[chroot 1] Configurazione locale: $LOCALE..."
+sed -i "s|^#\(${LOCALE//./\\.} \)|\1|" /etc/default/libc-locales
+sed -i 's|^#\(en_US\.UTF-8 \)|\1|' /etc/default/libc-locales
+xbps-reconfigure -f glibc-locales
+
+cat > /etc/locale.conf <<EOF
+LANG=${LOCALE}
+LC_COLLATE=C
+EOF
+
+### HOSTNAME ###
+echo "[chroot 2] Hostname: $HOSTNAME..."
+echo "$HOSTNAME" > /etc/hostname
+cat > /etc/hosts <<EOF
+127.0.0.1   localhost
+127.0.1.1   ${HOSTNAME}.localdomain ${HOSTNAME}
+::1         localhost ip6-localhost ip6-loopback
+ff02::1     ip6-allnodes
+ff02::2     ip6-allrouters
+EOF
+
+### TIMEZONE E TASTIERA ###
+echo "[chroot 3] Timezone e tastiera..."
+ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+hwclock --systohc 2>/dev/null || true
+
+{
+    grep -v "^KEYMAP=\|^HARDWARECLOCK=\|^TIMEZONE=" /etc/rc.conf 2>/dev/null || true
+    echo "KEYMAP=\"${KEYMAP}\""
+    echo 'HARDWARECLOCK="UTC"'
+    echo "TIMEZONE=\"${TIMEZONE}\""
+} > /etc/rc.conf.new
+mv /etc/rc.conf.new /etc/rc.conf
+
+### SWAPFILE ###
+echo "[chroot 4] Creazione swapfile (${SWAP_SIZE}GB)..."
+if [[ "$FS_TYPE" == "btrfs" ]]; then
+    # Swapfile su BTRFS: deve essere contiguo (no Copy-on-Write, no compressione).
+    # Il subvolume @swap è già montato su /swap dall'installer.
+    SWAPFILE=/swap/swapfile
+    truncate -s 0 "$SWAPFILE"
+    chattr +C "$SWAPFILE"     # disabilita CoW sul file (non sul subvolume)
+    chmod 600 "$SWAPFILE"
+    dd if=/dev/zero of="$SWAPFILE" bs=1G count="$SWAP_SIZE" status=progress
+    mkswap "$SWAPFILE"
+else
+    # ext4: nessun vincolo CoW, fallocate è sufficiente.
+    mkdir -p /swap
+    fallocate -l "${SWAP_SIZE}G" /swap/swapfile
+    chmod 600 /swap/swapfile
+    mkswap /swap/swapfile
+fi
+
+### FSTAB ###
+echo "[chroot 5] Generazione /etc/fstab..."
+EFI_UUID=$(blkid -s UUID -o value "$EFI_PART")
+ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
+
+if [[ "$FS_TYPE" == "btrfs" ]]; then
+    # @swap: senza compress e senza discard (incompatibili con swapfile BTRFS)
+    SWAP_BTRFS_OPTS="rw,noatime,ssd,space_cache=v2"
+    cat > /etc/fstab <<EOF
+# /etc/fstab — generato da void-installer-light (btrfs)
+
+UUID=${ROOT_UUID}  /               btrfs  ${BTRFS_OPTS},subvol=@           0  1
+UUID=${ROOT_UUID}  /home           btrfs  ${BTRFS_OPTS},subvol=@home       0  2
+UUID=${ROOT_UUID}  /.snapshots     btrfs  ${BTRFS_OPTS},subvol=@snapshots  0  2
+UUID=${ROOT_UUID}  /var/log        btrfs  ${BTRFS_OPTS},subvol=@var_log        0  2
+UUID=${ROOT_UUID}  /var/cache/xbps btrfs  ${BTRFS_OPTS},subvol=@var_cache_xbps 0  2
+UUID=${ROOT_UUID}  /srv            btrfs  ${BTRFS_OPTS},subvol=@srv            0  2
+UUID=${ROOT_UUID}  /swap           btrfs  ${SWAP_BTRFS_OPTS},subvol=@swap  0  2
+/swap/swapfile     none            swap   sw                                0  0
+tmpfs              /tmp            tmpfs  defaults,nodev,nosuid,noexec,size=4G  0  0
+UUID=${EFI_UUID}   /boot           vfat   rw,noatime,nosuid,nodev,noexec,umask=0077,fmask=0177,dmask=0077  0  2
+EOF
+else
+    cat > /etc/fstab <<EOF
+# /etc/fstab — generato da void-installer-light (ext4)
+
+UUID=${ROOT_UUID}  /     ext4  rw,noatime,errors=remount-ro  0  1
+/swap/swapfile     none  swap  sw                             0  0
+tmpfs              /tmp  tmpfs defaults,nodev,nosuid,noexec,size=4G  0  0
+UUID=${EFI_UUID}   /boot vfat  rw,noatime,nosuid,nodev,noexec,umask=0077,fmask=0177,dmask=0077  0  2
+EOF
+fi
+
+### DRACUT ###
+echo "[chroot 6] Configurazione dracut..."
+mkdir -p /etc/dracut.conf.d
+# Nessun modulo crypt (no LUKS). Per BTRFS è necessario il modulo btrfs.
+if [[ "$FS_TYPE" == "btrfs" ]]; then
+    cat > /etc/dracut.conf.d/10-base.conf <<'EOF'
+hostonly=yes
+hostonly_cmdline=yes
+add_dracutmodules+=" btrfs "
+compress=zstd
+EOF
+else
+    cat > /etc/dracut.conf.d/10-base.conf <<'EOF'
+hostonly=yes
+hostonly_cmdline=yes
+compress=zstd
+EOF
+fi
+
+### HOOK KERNEL + EFISTUB ###
+echo "[chroot 7] Installazione hook aggiornamenti kernel..."
+mkdir -p /etc/kernel.d/post-install
+
+# Estrae numero partizione EFI e disk base (es. /dev/nvme0n1p1 → 1, /dev/nvme0n1)
+EFI_PARTNUM=$(echo "$EFI_PART" | grep -o '[0-9]*$')
+DISK_BASE=$(echo "$EFI_PART" | sed 's/p\?[0-9]*$//')
+ROOT_UUID_BAKED=$(blkid -s UUID -o value "$ROOT_PART")
+
+# Cmdline kernel: BTRFS richiede rootflags=subvol=@, ext4 no
+if [[ "$FS_TYPE" == "btrfs" ]]; then
+    KERNEL_CMDLINE="root=UUID=${ROOT_UUID_BAKED} rootfstype=btrfs rootflags=subvol=@ rw quiet loglevel=3"
+else
+    KERNEL_CMDLINE="root=UUID=${ROOT_UUID_BAKED} rw quiet loglevel=3"
+fi
+
+cat > /etc/efistub.conf <<EOF
+# /etc/efistub.conf — configurazione hook efistub (void-installer-light)
+# Per modificare i parametri kernel: edita KERNEL_CMDLINE e riesegui l'hook.
+#   /etc/kernel.d/post-install/10-efistub \$(ls /boot/vmlinuz-* | sort -V | tail -1 | sed 's|/boot/vmlinuz-||')
+
+DISK=${DISK_BASE}
+EFI_PARTNUM=${EFI_PARTNUM}
+EFI_DIR=/boot/EFI/void
+KERNEL_CMDLINE="${KERNEL_CMDLINE}"
+EOF
+
+# Hook scritto con heredoc delimitato da 'HOOK_EOF' (nessuna espansione variabili)
+cat > /etc/kernel.d/post-install/10-efistub <<'HOOK_EOF'
+#!/bin/bash
+# Hook efistub: aggiorna la partizione EFI e l'entry UEFI a ogni kernel update.
+# Chiamato dal trigger xbps con la versione kernel come $1.
+
+set -euo pipefail
+
+KVER="$1"
+[[ -f /etc/efistub.conf ]] || { echo "efistub: /etc/efistub.conf non trovato." >&2; exit 1; }
+# shellcheck source=/etc/efistub.conf
+source /etc/efistub.conf
+
+KERNEL="/boot/vmlinuz-${KVER}"
+INITRAMFS="/boot/initramfs-${KVER}.img"
+
+[[ -f "$KERNEL" ]] || { echo "efistub: $KERNEL non trovato, skip." >&2; exit 0; }
+
+# Attende la generazione dell'initramfs (il trigger xbps può girare in parallelo)
+TIMEOUT=30; i=0
+while [[ ! -f "$INITRAMFS" && $i -lt $TIMEOUT ]]; do sleep 1; i=$((i+1)); done
+[[ -f "$INITRAMFS" ]] || echo "efistub: initramfs non trovato dopo ${TIMEOUT}s, skip copia." >&2
+
+mkdir -p "$EFI_DIR"
+cp "$KERNEL" "${EFI_DIR}/vmlinuz"
+[[ -f "$INITRAMFS" ]] && cp "$INITRAMFS" "${EFI_DIR}/initramfs.img"
+
+# Rimuove le entry UEFI "Void Linux" esistenti per evitare duplicati
+efibootmgr --unicode 2>/dev/null \
+    | grep -F "Void Linux" \
+    | grep -o 'Boot[0-9A-F]\{4\}' \
+    | sed 's/Boot//' \
+    | while read -r n; do
+        efibootmgr --bootnum "$n" --delete-bootnum --quiet 2>/dev/null || true
+      done || true
+
+# initrd= usa separatori backslash (sintassi UEFI, non Unix)
+CMDLINE="${KERNEL_CMDLINE} initrd=\\EFI\\void\\initramfs.img"
+
+efibootmgr --create \
+    --disk "$DISK" \
+    --part "$EFI_PARTNUM" \
+    --label "Void Linux" \
+    --loader '\EFI\void\vmlinuz' \
+    --unicode "$CMDLINE" \
+    --quiet
+
+echo "efistub: entry UEFI aggiornata per kernel ${KVER}"
+HOOK_EOF
+chmod +x /etc/kernel.d/post-install/10-efistub
+
+### MICROCODE ###
+echo "[chroot 8] Installazione microcode ($CPU_VENDOR)..."
+xbps-install -Sy void-repo-nonfree
+if [[ "$CPU_VENDOR" == "intel" ]]; then
+    xbps-install -Sy intel-ucode
+elif [[ "$CPU_VENDOR" == "amd" ]]; then
+    xbps-install -Sy linux-firmware-amd
+else
+    echo "ATTENZIONE: vendor '$CPU_VENDOR' non riconosciuto, microcode non installato."
+fi
+
+### INITRAMFS + ENTRY UEFI ###
+echo "[chroot 9] Generazione initramfs e configurazione UEFI..."
+mkdir -p /boot/EFI/void
+xbps-reconfigure -fa
+
+for KVER_PATH in /boot/vmlinuz-*; do
+    [[ -f "$KVER_PATH" ]] || continue
+    KVER="${KVER_PATH#/boot/vmlinuz-}"
+    echo "  Boot entry per kernel: $KVER"
+    /etc/kernel.d/post-install/10-efistub "$KVER" || \
+        echo "  ATTENZIONE: hook fallito per kernel $KVER"
+done
+
+echo "  Entry UEFI configurate:"
+efibootmgr --unicode 2>/dev/null | grep -iE "boot[0-9a-f]{4}|void" || true
+
+### UTENTE E SUDO ###
+echo "[chroot 10] Configurazione utente..."
+useradd \
+    --create-home \
+    --groups wheel,audio,video,optical,storage,network,plugdev \
+    --shell /bin/bash \
+    "$USERNAME"
+echo "Imposta la password per $USERNAME:"
+passwd "$USERNAME"
+
+xbps-install -Sy sudo
+echo "%wheel ALL=(ALL:ALL) ALL" > /etc/sudoers.d/wheel
+chmod 440 /etc/sudoers.d/wheel
+
+echo "Imposta la password per root:"
+passwd root
+
+echo "umask 027" > /etc/profile.d/00-umask.sh
+
+### FLUXBOX + XORG ###
+echo "[chroot 11] Installazione Fluxbox + Xorg..."
+xbps-install -Sy \
+    fluxbox \
+    xorg-server \
+    xf86-input-libinput \
+    xinit \
+    xterm \
+    xrandr \
+    xset \
+    setxkbmap \
+    xauth \
+    feh \
+    dmenu \
+    dejavu-fonts-ttf \
+    font-alias
+
+# .xinitrc di default: imposta la tastiera e avvia fluxbox
+# Inserito in /etc/skel/ così è disponibile per tutti i nuovi utenti
+cat > /etc/skel/.xinitrc <<'EOF'
+#!/bin/sh
+# Carica layout tastiera (da /etc/rc.conf)
+[ -f /etc/rc.conf ] && . /etc/rc.conf
+[ -n "${KEYMAP:-}" ] && setxkbmap "$KEYMAP"
+
+exec startfluxbox
+EOF
+chmod +x /etc/skel/.xinitrc
+
+# Copia .xinitrc nell'home dell'utente creato
+cp /etc/skel/.xinitrc "/home/${USERNAME}/.xinitrc"
+chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.xinitrc"
+
+# Avvio automatico di X su tty1 al login.
+# Per avvio manuale: commenta o rimuovi /etc/profile.d/50-startx.sh dopo l'installazione.
+cat > /etc/profile.d/50-startx.sh <<'EOF'
+# Avvia X automaticamente su tty1 al primo login
+if [ -z "${DISPLAY:-}" ] && [ "$(tty)" = "/dev/tty1" ]; then
+    exec startx
+fi
+EOF
+
+### NETWORKING ###
+echo "[chroot 12] Networking..."
+# dhcpcd per connettività cablata/DHCP.
+# Per WiFi: xbps-install -Sy wpa_supplicant (post-install)
+xbps-install -Sy dhcpcd
+ln -sf /etc/sv/dhcpcd /etc/runit/runsvdir/default/
+ln -sf /etc/sv/dbus   /etc/runit/runsvdir/default/
+
+### SYSCTL HARDENING ###
+echo "[chroot 13] Hardening sysctl..."
+mkdir -p /etc/sysctl.d
+cat > /etc/sysctl.d/99-hardening.conf <<'EOF'
+kernel.dmesg_restrict = 1
+kernel.kptr_restrict = 2
+kernel.randomize_va_space = 2
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+EOF
+
+echo ""
+echo "=== Chroot completato ==="
+echo ""
+printf "  %-14s %s\n" "Filesystem:" "$FS_TYPE"
+printf "  %-14s %s\n" "Boot:"       "efistub classico"
+printf "  %-14s %s\n" "Kernel:"     "/boot/EFI/void/vmlinuz"
+printf "  %-14s %s\n" "Initramfs:"  "/boot/EFI/void/initramfs.img"
+printf "  %-14s %s\n" "Desktop:"    "Fluxbox (startx)"
+echo ""
+echo "Comandi utili post-install:"
+echo "  efibootmgr -v                   # verifica entry UEFI"
+echo "  xbps-install -Su                # aggiornamenti"
+echo "  xbps-install -Sy wpa_supplicant # per WiFi"
+echo "  cat /etc/efistub.conf           # configurazione boot"
+echo ""

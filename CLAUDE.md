@@ -52,6 +52,18 @@ Configured by environment variables exported from Stage 1:
 - sysctl hardening (ASLR, dmesg_restrict, kptr_restrict)
 - SSH pre-hardening (no root login, no password auth)
 
+## `void-installer-light` + `void-installer-light-chroot`
+
+Alternative all'installer principale: nessuna cifratura, nessun Secure Boot. Scelta interattiva del filesystem (BTRFS o ext4). Desktop minimale con Fluxbox + Xorg (niente display manager, avvio via `startx` o auto-avvio su tty1).
+
+- **BTRFS**: stessi subvolumi del void-installer principale (`@`, `@home`, `@swap`, `@snapshots`, `@var_log`, `@var_cache_xbps`, `@srv`), stesse opzioni di mount
+- **ext4**: layout piatto, partizione singola; `/swap/swapfile` creato con `fallocate`
+- **Hook efistub semplificato**: solo modalità classica (no UKI, no Secure Boot), legge `KERNEL_CMDLINE` da `/etc/efistub.conf`
+- **Fluxbox**: `xorg-server`, `xinit`, `xterm`, `feh`, `dmenu`; `.xinitrc` con `exec startfluxbox`; auto-avvio X su tty1 via `/etc/profile.d/50-startx.sh`
+- **Networking**: `dhcpcd`; WiFi richiede `wpa_supplicant` manualmente post-install
+
+Variabili preimpostabili via env: `DISK_NAME`, `HOSTNAME`, `USERNAME`, `CPU_VENDOR`, `FS_TYPE`, `LOCALE`, `TIMEZONE`, `KEYMAP`, `SWAP_SIZE`.
+
 ## `void-installer-desktop`
 
 Separate script called from `void-installer-chroot` when `ENABLE_DESKTOP=true`. Installs Cinnamon desktop environment as a faithful replica of the current system:
