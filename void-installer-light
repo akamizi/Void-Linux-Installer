@@ -89,10 +89,17 @@ if [[ ! -b "$DISK_NAME" ]]; then
     exit 1
 fi
 
-if [[ -z "${HOSTNAME:-}" ]]; then
-    read -rp "Hostname della macchina: " HOSTNAME
+# HOSTNAME è una variabile automatica di bash (sempre valorizzata), quindi non
+# può fare da flag "non impostato". Si usa TARGET_HOSTNAME; per compatibilità si
+# accetta HOSTNAME solo se arriva dall'ambiente (es. HOSTNAME=myvoid ./void-installer-light).
+if [[ -z "${TARGET_HOSTNAME:-}" ]]; then
+    if [[ "$(declare -p HOSTNAME 2>/dev/null)" == "declare -x"* ]]; then
+        TARGET_HOSTNAME="$HOSTNAME"
+    else
+        read -rp "Hostname della macchina: " TARGET_HOSTNAME
+    fi
 fi
-if [[ ! "$HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
+if [[ ! "$TARGET_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
     echo "ERRORE: hostname non valido." >&2; exit 1
 fi
 
@@ -140,7 +147,7 @@ echo "========================================================"
 echo " ATTENZIONE: TUTTI I DATI SU $DISK_NAME VERRANNO PERSI"
 echo "========================================================"
 printf "  %-14s %s\n" "Disco:"      "$DISK_NAME"
-printf "  %-14s %s\n" "Hostname:"   "$HOSTNAME"
+printf "  %-14s %s\n" "Hostname:"   "$TARGET_HOSTNAME"
 printf "  %-14s %s\n" "Utente:"     "$USERNAME"
 printf "  %-14s %s\n" "CPU:"        "$CPU_VENDOR"
 printf "  %-14s %s\n" "Filesystem:" "$FS_TYPE"
@@ -234,7 +241,7 @@ cp /etc/resolv.conf /mnt/etc/resolv.conf
 cp "$SCRIPT_DIR/void-installer-light-chroot" /mnt/void-installer-light-chroot
 chmod +x /mnt/void-installer-light-chroot
 
-HOSTNAME="$HOSTNAME" \
+HOSTNAME="$TARGET_HOSTNAME" \
 BTRFS_OPTS="$BTRFS_OPTS" \
 DISK_NAME="$DISK_NAME" \
 EFI_PART="$EFI_PART" \

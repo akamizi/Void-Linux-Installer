@@ -129,11 +129,19 @@ if [[ ! -b "$DISK_NAME" ]]; then
     exit 1
 fi
 
-if [[ -z "${HOSTNAME:-}" ]]; then
-    read -rp "Hostname della macchina: " HOSTNAME
+# HOSTNAME è una variabile automatica di bash (sempre valorizzata col nome del
+# sistema live), quindi non può fare da flag "non impostato": il prompt non
+# apparirebbe mai. Si usa TARGET_HOSTNAME; per compatibilità si accetta HOSTNAME
+# solo se arriva dall'ambiente (es. HOSTNAME=myvoid ./void-installer).
+if [[ -z "${TARGET_HOSTNAME:-}" ]]; then
+    if [[ "$(declare -p HOSTNAME 2>/dev/null)" == "declare -x"* ]]; then
+        TARGET_HOSTNAME="$HOSTNAME"
+    else
+        read -rp "Hostname della macchina: " TARGET_HOSTNAME
+    fi
 fi
 # Validazione hostname: solo lettere, numeri, trattini; max 63 caratteri
-if [[ ! "$HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
+if [[ ! "$TARGET_HOSTNAME" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
     echo "ERRORE: hostname non valido (solo lettere, numeri, trattini; max 63 caratteri)." >&2
     exit 1
 fi
@@ -214,6 +222,10 @@ fi
 echo ""
 while true; do
     read -s -rp "Passphrase di cifratura disco: " PASSPHRASE; echo ""
+    if [[ -z "$PASSPHRASE" ]]; then
+        echo "La passphrase non può essere vuota, riprova."
+        continue
+    fi
     read -s -rp "Conferma passphrase:           " PASSPHRASE2; echo ""
     [[ "$PASSPHRASE" == "$PASSPHRASE2" ]] && break
     echo "Le passphrase non coincidono, riprova."
@@ -226,7 +238,7 @@ echo "========================================================"
 echo " ATTENZIONE: TUTTI I DATI SU $DISK_NAME VERRANNO PERSI"
 echo "========================================================"
 printf "  %-14s %s\n" "Disco:"        "$DISK_NAME"
-printf "  %-14s %s\n" "Hostname:"     "$HOSTNAME"
+printf "  %-14s %s\n" "Hostname:"     "$TARGET_HOSTNAME"
 printf "  %-14s %s\n" "Utente:"       "$USERNAME"
 printf "  %-14s %s\n" "CPU:"          "$CPU_VENDOR"
 printf "  %-14s %s\n" "Locale:"       "$LOCALE"
@@ -373,9 +385,11 @@ echo "[6/7] Installazione sistema base Void Linux..."
 BASE_PKGS=(base-system btrfs-progs cryptsetup gptfdisk efibootmgr)
 
 # Pacchetti per UKI:
-#   gummiboot  — PE stub EFI usato da dracut come template per l'UKI
-#   binutils   — fornisce objcopy, usato da dracut --uefi per assemblare il PE/EFI
-[[ "$ENABLE_UKI" == "true" ]] && BASE_PKGS+=(gummiboot binutils)
+#   systemd-boot-efistub — fornisce /usr/lib/systemd/boot/efi/linuxx64.efi.stub,
+#                          il PE stub usato da dracut --uefi come template per l'UKI
+#                          (il vecchio 'gummiboot' è ora un dummy transitional)
+#   binutils             — fornisce objcopy, usato da dracut --uefi per assemblare il PE/EFI
+[[ "$ENABLE_UKI" == "true" ]] && BASE_PKGS+=(systemd-boot-efistub binutils)
 
 # Pacchetti per Secure Boot:
 #   sbsigntool — sbsign (firma EFI binari), sbverify (verifica firme)
@@ -386,9 +400,13 @@ BASE_PKGS=(base-system btrfs-progs cryptsetup gptfdisk efibootmgr)
 # Pacchetti per Snapper
 [[ "$ENABLE_SNAPPER" == "true" ]] && BASE_PKGS+=(snapper)
 
+# EXTRA_PACKAGES arriva dall'ambiente come stringa (gli array bash non sono
+# esportabili): word-splitting esplicito in un array locale.
+read -ra _extra_pkgs <<< "${EXTRA_PACKAGES:-}"
+
 XBPS_ARCH=x86_64 xbps-install -S -y -R "$REPO" -r /mnt \
     "${BASE_PKGS[@]}" \
-    ${EXTRA_PACKAGES[@]+"${EXTRA_PACKAGES[@]}"}
+    ${_extra_pkgs[@]+"${_extra_pkgs[@]}"}
 
 ### CHROOT ###
 echo "[7/7] Configurazione sistema (chroot)..."
@@ -404,7 +422,7 @@ if [[ "$ENABLE_DESKTOP" == "true" ]]; then
     chmod +x /mnt/void-installer-desktop
 fi
 
-HOSTNAME="$HOSTNAME" \
+HOSTNAME="$TARGET_HOSTNAME" \
 BTRFS_OPTS="$BTRFS_OPTS" \
 DISK_NAME="$DISK_NAME" \
 EFI_PART="$EFI_PART" \
