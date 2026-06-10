@@ -19,7 +19,7 @@ DISK_NAME=/dev/nvme0n1 HOSTNAME=myvoid USERNAME=alice ENABLE_UKI=true ./void-ins
 **Prerequisites on live ISO:**
 ```bash
 xbps-install -Sy git gptfdisk
-# Optional: btrfs-progs cryptsetup dosfstools efibootmgr gummiboot binutils
+# Optional: btrfs-progs cryptsetup dosfstools efibootmgr systemd-boot-efistub binutils
 ```
 
 ## Two-Stage Architecture
@@ -46,7 +46,7 @@ Configured by environment variables exported from Stage 1:
 - **Optional Secure Boot** (`ENABLE_SECUREBOOT=true`): RSA4096 key generation (PK/KEK/db), UKI signing, UEFI enrollment attempt
 - **Optional Snapper** (`ENABLE_SNAPPER=true`): automated BTRFS snapshots on `/` and `/home`
 - **Optional Desktop** (`ENABLE_DESKTOP=true`): calls `/void-installer-desktop` (see below), replaces dhcpcd with NetworkManager
-- `/etc/kernel.d/post-install/10-efistub` hook: auto-rebuilds EFI on kernel updates
+- `/etc/kernel.d/post-install/30-efistub` hook: auto-rebuilds EFI on kernel updates
 - Intel/AMD microcode detection and installation
 - User creation, sudo/wheel membership
 - sysctl hardening (ASLR, dmesg_restrict, kptr_restrict)
@@ -70,10 +70,10 @@ Separate script called from `void-installer-chroot` when `ENABLE_DESKTOP=true`. 
 - Packages: `cinnamon-all`, `nemo` + extensions, `xfce4-terminal`, `xorg-server`, `greetd`, `elogind`, `seatd`, `pipewire`, `wireplumber`, `alsa-pipewire`, `NetworkManager` + applet, `polkit-gnome`, `gnome-keyring`, `power-profiles-daemon`, `touchegg`, base fonts
 - Configures `/etc/greetd/config.toml` (agreety + cinnamon-session)
 - Sets up ALSA→PipeWire symlinks in `/etc/alsa/conf.d/`
-- Enables services: `dbus`, `elogind`, `seatd`, `NetworkManager`, `greetd`, `power-profiles-daemon`, `touchegg`, `pipewire` (system-level)
+- Enables services: `dbus`, `elogind`, `seatd`, `NetworkManager`, `greetd`, `power-profiles-daemon`, `touchegg`
 - Removes `dhcpcd` symlink (replaced by NetworkManager)
 
-PipeWire runs as a system service (simpler with runit, suitable for single-user desktops). `wireplumber` starts per-user via Cinnamon's XDG autostart.
+PipeWire starts per-user via `/etc/xdg/autostart/pipewire.desktop` (Void's pipewire package ships no runit service); pipewire itself spawns `wireplumber` and `pipewire-pulse` via `context.exec`. greetd runs on VT 7 as user `_greeter` (VT 1-6 are taken by the default agetty services).
 
 ## Key Generated Files
 
@@ -83,7 +83,7 @@ PipeWire runs as a system service (simpler with runit, suitable for single-user 
 | `/etc/dracut.conf.d/20-uki.conf` | UKI-specific config (if enabled) |
 | `/etc/kernel/cmdline` | Kernel cmdline embedded in UKI |
 | `/etc/efistub.conf` | Read by kernel update hook |
-| `/etc/kernel.d/post-install/10-efistub` | Post-kernel-update EFI hook |
+| `/etc/kernel.d/post-install/30-efistub` | Post-kernel-update EFI hook |
 | `/etc/secureboot/{PK,KEK,db}.{key,crt}` | Secure Boot keys (if enabled) |
 | `/boot/EFI/void/void-linux.efi` | UKI binary (if UKI mode) |
 

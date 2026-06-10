@@ -161,7 +161,7 @@ sudo vim /etc/efistub.conf
 
 # 2. Re-run the hook to update the EFI entry
 kver=$(ls /boot/vmlinuz-* | sort -V | tail -1 | sed 's|/boot/vmlinuz-||')
-sudo /etc/kernel.d/post-install/10-efistub "$kver"
+sudo /etc/kernel.d/post-install/30-efistub "$kver"
 ```
 
 ---

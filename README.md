@@ -253,7 +253,7 @@ ENABLE_DESKTOP=true ./void-installer
 This runs `void-installer-desktop` inside the chroot, which installs:
 - **Cinnamon** desktop environment (`cinnamon-all`)
 - **greetd** login manager (with `agreety` greeter, `cinnamon-session` default)
-- **PipeWire** audio (system-level service; `wireplumber` per-user via XDG autostart)
+- **PipeWire** audio (per-user via XDG autostart; spawns `wireplumber` and `pipewire-pulse`)
 - **NetworkManager** (replaces `dhcpcd`)
 - **nemo** file manager, **xfce4-terminal**, **polkit-gnome**, **gnome-keyring**,
   `power-profiles-daemon`, `touchegg`, base fonts
@@ -292,7 +292,7 @@ vim /etc/kernel/cmdline
 
 # 2. Rebuild the UKI and update the UEFI entry
 kver=$(ls /boot/vmlinuz-* | sort -V | tail -1 | sed 's|/boot/vmlinuz-||')
-/etc/kernel.d/post-install/10-efistub "$kver"
+/etc/kernel.d/post-install/30-efistub "$kver"
 ```
 
 ### Secure Boot — manual key enrollment
