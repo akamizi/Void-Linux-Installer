@@ -133,7 +133,7 @@ fi
 cat > /etc/efistub.conf <<EOF
 # /etc/efistub.conf — configurazione hook efistub (void-installer-light)
 # Per modificare i parametri kernel: edita KERNEL_CMDLINE e riesegui l'hook.
-#   /etc/kernel.d/post-install/10-efistub \$(ls /boot/vmlinuz-* | sort -V | tail -1 | sed 's|/boot/vmlinuz-||')
+#   /etc/kernel.d/post-install/30-efistub \$(ls /boot/vmlinuz-* | sort -V | tail -1 | sed 's|/boot/vmlinuz-||')
 
 DISK=${DISK_BASE}
 EFI_PARTNUM=${EFI_PARTNUM}
@@ -141,15 +141,18 @@ EFI_DIR=/boot/EFI/void
 KERNEL_CMDLINE="${KERNEL_CMDLINE}"
 EOF
 
-# Hook scritto con heredoc delimitato da 'HOOK_EOF' (nessuna espansione variabili)
-cat > /etc/kernel.d/post-install/10-efistub <<'HOOK_EOF'
+# Hook scritto con heredoc delimitato da 'HOOK_EOF' (nessuna espansione variabili).
+# Il prefisso 30- è OBBLIGATORIO: il 20-dracut di Void (che genera l'initramfs)
+# deve girare PRIMA di questo hook (ordine lessicale).
+cat > /etc/kernel.d/post-install/30-efistub <<'HOOK_EOF'
 #!/bin/bash
 # Hook efistub: aggiorna la partizione EFI e l'entry UEFI a ogni kernel update.
-# Chiamato dal trigger xbps con la versione kernel come $1.
+# Il trigger xbps kernel-hooks chiama gli hook con $1=pkgname $2=versione;
+# con un solo argomento (invocazione manuale) $1 è la versione.
 
 set -euo pipefail
 
-KVER="$1"
+KVER="${2:-$1}"
 [[ -f /etc/efistub.conf ]] || { echo "efistub: /etc/efistub.conf non trovato." >&2; exit 1; }
 # shellcheck source=/etc/efistub.conf
 source /etc/efistub.conf
@@ -159,7 +162,8 @@ INITRAMFS="/boot/initramfs-${KVER}.img"
 
 [[ -f "$KERNEL" ]] || { echo "efistub: $KERNEL non trovato, skip." >&2; exit 0; }
 
-# Attende la generazione dell'initramfs (il trigger xbps può girare in parallelo)
+# L'initramfs è già stato generato dall'hook 20-dracut (ordine lessicale);
+# l'attesa è solo una rete di sicurezza per invocazioni manuali fuori sequenza.
 TIMEOUT=30; i=0
 while [[ ! -f "$INITRAMFS" && $i -lt $TIMEOUT ]]; do sleep 1; i=$((i+1)); done
 [[ -f "$INITRAMFS" ]] || echo "efistub: initramfs non trovato dopo ${TIMEOUT}s, skip copia." >&2
@@ -190,7 +194,7 @@ efibootmgr --create \
 
 echo "efistub: entry UEFI aggiornata per kernel ${KVER}"
 HOOK_EOF
-chmod +x /etc/kernel.d/post-install/10-efistub
+chmod +x /etc/kernel.d/post-install/30-efistub
 
 ### MICROCODE ###
 echo "[chroot 8] Installazione microcode ($CPU_VENDOR)..."
@@ -212,7 +216,7 @@ for KVER_PATH in /boot/vmlinuz-*; do
     [[ -f "$KVER_PATH" ]] || continue
     KVER="${KVER_PATH#/boot/vmlinuz-}"
     echo "  Boot entry per kernel: $KVER"
-    /etc/kernel.d/post-install/10-efistub "$KVER" || \
+    /etc/kernel.d/post-install/30-efistub "$KVER" || \
         echo "  ATTENZIONE: hook fallito per kernel $KVER"
 done
 
@@ -292,8 +296,10 @@ EOF
 ### NETWORKING ###
 echo "[chroot 12] Networking..."
 # dhcpcd per connettività cablata/DHCP.
+# dbus va installato esplicitamente: base-system non lo include e nessuno dei
+# pacchetti Fluxbox/Xorg lo tira come dipendenza (senza, il symlink sarebbe dangling).
 # Per WiFi: xbps-install -Sy wpa_supplicant (post-install)
-xbps-install -Sy dhcpcd
+xbps-install -Sy dhcpcd dbus
 ln -sf /etc/sv/dhcpcd /etc/runit/runsvdir/default/
 ln -sf /etc/sv/dbus   /etc/runit/runsvdir/default/
 

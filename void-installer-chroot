@@ -163,7 +163,7 @@ EOF
 #
 # Nota sulla doppia esecuzione di dracut in modalità UKI:
 #   Il trigger xbps che installa nuovi kernel chiama dracut → genera initramfs normale.
-#   Il nostro hook (/etc/kernel.d/post-install/10-efistub) chiama poi dracut --uefi → UKI.
+#   Il nostro hook (/etc/kernel.d/post-install/30-efistub) chiama poi dracut --uefi → UKI.
 #   Due esecuzioni dracut per kernel update sono un overhead accettabile (~30s extra).
 #   L'alternativa (uefi=yes in dracut.conf) causerebbe due UKI: uno generato dal trigger
 #   xbps e uno dall'hook — confusione garantita. Il design attuale è esplicito e controllato.
@@ -317,6 +317,9 @@ fi
 #
 # Nome fisso (vmlinuz / void-linux.efi): l'entry efibootmgr resta valida tra update.
 #
+# Il prefisso 30- è OBBLIGATORIO: gli hook girano in ordine lessicale e il
+# 20-dracut di Void (che genera l'initramfs) deve girare PRIMA di questo hook.
+# Con un prefisso < 20 l'hook copierebbe un initramfs stantio o assente.
 echo "[chroot 10] Installazione hook aggiornamenti kernel..."
 mkdir -p /etc/kernel.d/post-install
 
@@ -327,7 +330,7 @@ DISK_BASE=$(echo "$EFI_PART" | sed 's/p\?[0-9]*$//')
 
 cat > /etc/efistub.conf <<EOF
 # /etc/efistub.conf — configurazione hook efistub/UKI
-# Editare e poi eseguire /etc/kernel.d/post-install/10-efistub <kver> per applicare.
+# Editare e poi eseguire /etc/kernel.d/post-install/30-efistub <kver> per applicare.
 
 ENABLE_UKI=${ENABLE_UKI}
 ENABLE_SECUREBOOT=${ENABLE_SECUREBOOT}
@@ -343,14 +346,16 @@ SB_KEY=/etc/secureboot/db.key
 SB_CERT=/etc/secureboot/db.crt
 EOF
 
-cat > /etc/kernel.d/post-install/10-efistub <<'HOOK_EOF'
+cat > /etc/kernel.d/post-install/30-efistub <<'HOOK_EOF'
 #!/bin/bash
 # Hook efistub/UKI: aggiorna la partizione EFI e l'entry UEFI dopo ogni kernel update.
-# Chiamato dal trigger xbps con la versione kernel come argomento $1.
+# Il trigger xbps kernel-hooks chiama gli hook con $1=pkgname $2=versione
+# (vedi /etc/kernel.d/post-install/20-dracut). Con un solo argomento
+# (invocazione manuale) $1 è la versione.
 
 set -euo pipefail
 
-KVER="$1"
+KVER="${2:-$1}"
 CONFIG=/etc/efistub.conf
 
 [[ -f "$CONFIG" ]] || { echo "efistub hook: $CONFIG non trovato." >&2; exit 1; }
@@ -388,7 +393,8 @@ if [[ "$ENABLE_UKI" == "true" ]]; then
     UKI_UNSIGNED="${EFI_DIR}/void-linux-unsigned.efi"
     UKI_FINAL="${EFI_DIR}/void-linux.efi"
 
-    # Attendi initramfs generato dal trigger xbps (dracut normale, senza --uefi)
+    # L'initramfs è già stato generato dall'hook 20-dracut (ordine lessicale);
+    # l'attesa è solo una rete di sicurezza per invocazioni manuali fuori sequenza.
     TIMEOUT=60; i=0
     while [[ ! -f "$INITRAMFS" && $i -lt $TIMEOUT ]]; do sleep 1; i=$((i+1)); done
     [[ -f "$INITRAMFS" ]] || echo "efistub hook: initramfs non trovato dopo ${TIMEOUT}s, dracut lo genererà." >&2
@@ -444,7 +450,7 @@ else
     echo "efistub hook: entry UEFI aggiornata → efistub classico ${KVER}"
 fi
 HOOK_EOF
-chmod +x /etc/kernel.d/post-install/10-efistub
+chmod +x /etc/kernel.d/post-install/30-efistub
 
 ### GENERAZIONE INITRAMFS / UKI + ENTRY UEFI INIZIALE ###
 echo "[chroot 11] Generazione initramfs/UKI e configurazione entry UEFI..."
@@ -461,7 +467,7 @@ for KVER_PATH in /boot/vmlinuz-*; do
     [[ -f "$KVER_PATH" ]] || continue
     KVER="${KVER_PATH#/boot/vmlinuz-}"
     echo "Configurazione boot entry per kernel: $KVER"
-    /etc/kernel.d/post-install/10-efistub "$KVER" || \
+    /etc/kernel.d/post-install/30-efistub "$KVER" || \
         echo "ATTENZIONE: hook fallito per kernel $KVER (vedi output sopra)"
 done
 
@@ -565,14 +571,20 @@ if [[ "$ENABLE_SNAPPER" == "true" ]]; then
         TIMELINE_LIMIT_MONTHLY=0   \
         TIMELINE_LIMIT_YEARLY=0
 
-    # Abilita servizi runit snapper (se presenti nel pacchetto)
-    for svc in snapper-timeline snapper-cleanup; do
+    # Su Void snapper non ha servizi timeline/cleanup dedicati: il pacchetto
+    # fornisce snapperd (attivato via D-Bus) e /etc/cron.hourly/snapper, che
+    # esegue timeline e cleanup. Serve quindi un demone cron (cronie).
+    xbps-install -Sy cronie
+    #
+    # NOTA: i symlink vanno in /etc/runit/runsvdir/default/, NON in /var/service:
+    # /var/service punta a /run/runit/runsvdir/current, e in chroot /run è quello
+    # del sistema live (rbind) — il link sparirebbe al reboot.
+    for svc in dbus snapperd cronie; do
         if [[ -d "/etc/sv/$svc" ]]; then
-            ln -sf "/etc/sv/$svc" /var/service/
+            ln -sf "/etc/sv/$svc" /etc/runit/runsvdir/default/
             echo "  Servizio abilitato: $svc"
         else
             echo "  NOTA: servizio '$svc' non trovato — abilitare manualmente dopo l'install"
-            echo "        ln -s /etc/sv/$svc /var/service/"
         fi
     done
 
@@ -657,9 +669,11 @@ if [[ "${ENABLE_DESKTOP:-false}" == "true" ]]; then
     echo "[chroot 15] Installazione ambiente desktop..."
     /void-installer-desktop
 else
-    # Sistema base senza DE: dhcpcd per connettività minima
+    # Sistema base senza DE: dhcpcd per connettività minima (già in base-system).
+    # /etc/runit/runsvdir/default e non /var/service: quest'ultimo in chroot
+    # punta al /run del sistema live e il link andrebbe perso al reboot.
     xbps-install -Sy dhcpcd
-    ln -sf /etc/sv/dhcpcd /var/service/
+    ln -sf /etc/sv/dhcpcd /etc/runit/runsvdir/default/
 fi
 
 echo ""
