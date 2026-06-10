@@ -4,7 +4,7 @@
 #
 # Eseguito dentro chroot da void-installer-chroot (se ENABLE_DESKTOP=true).
 # Replica la configurazione del sistema base: Cinnamon su X11, greetd,
-# PipeWire (servizio di sistema), NetworkManager.
+# PipeWire (per-utente via XDG autostart), NetworkManager.
 #
 # Personalizzazione: modifica le variabili DESKTOP_PKGS qui sotto,
 # o la configurazione di greetd/PipeWire nelle sezioni successive.
@@ -53,19 +53,38 @@ xbps-install -Sy "${DESKTOP_PKGS[@]}"
 # --- Configurazione greetd ---
 # agreety: greeter testuale minimale incluso con greetd.
 # Alternativa grafica: installare ReGreet o gtkgreet e aggiornare il comando qui.
+#
+# vt = 7: i VT 1-6 sono occupati dai servizi agetty-tty1..6 abilitati di default
+#         da runit-void; usare vt=1 farebbe collidere greetd e agetty sullo stesso tty.
+# user = "_greeter": l'utente non privilegiato creato dal pacchetto greetd di Void
+#                    (NON "greetd": con un utente inesistente il greeter non parte).
 mkdir -p /etc/greetd
 cat > /etc/greetd/config.toml <<'EOF'
 [terminal]
-vt = 1
+vt = 7
 
 [default_session]
 command = "agreety --cmd cinnamon-session"
-user = "greetd"
+user = "_greeter"
 EOF
 
-# --- Configurazione PipeWire come servizio di sistema ---
-# PipeWire gira a livello di sistema (runit/default), wireplumber per-utente (XDG autostart).
-# Adeguato per desktop a utente singolo; su sistemi multi-utente preferire user services.
+# --- Configurazione PipeWire (per-utente via XDG autostart) ---
+# Il pacchetto pipewire di Void NON fornisce un servizio runit: va avviato
+# per-utente nella sessione. L'entry in /etc/xdg/autostart fa partire pipewire
+# al login Cinnamon; pipewire stesso lancia wireplumber e pipewire-pulse
+# (context.exec nella configurazione di default di Void).
+mkdir -p /etc/xdg/autostart
+cat > /etc/xdg/autostart/pipewire.desktop <<'EOF'
+[Desktop Entry]
+Name=PipeWire
+Comment=Start PipeWire
+Icon=pipewire
+Exec=pipewire
+Terminal=false
+Type=Application
+NoDisplay=true
+EOF
+
 mkdir -p /etc/alsa/conf.d
 ln -sf /usr/share/alsa/alsa.conf.d/50-pipewire.conf \
        /etc/alsa/conf.d/50-pipewire.conf
@@ -74,8 +93,7 @@ ln -sf /usr/share/alsa/alsa.conf.d/99-pipewire-default.conf \
 
 # --- Abilitazione servizi runit ---
 # NetworkManager sostituisce dhcpcd (gestisce DHCP internamente).
-# pipewire: servizio di sistema (vedi nota sopra).
-for svc in dbus elogind seatd NetworkManager greetd power-profiles-daemon touchegg pipewire; do
+for svc in dbus elogind seatd NetworkManager greetd power-profiles-daemon touchegg; do
     ln -sf /etc/sv/$svc /etc/runit/runsvdir/default/
 done
 
